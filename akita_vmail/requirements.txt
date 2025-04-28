@@ -1,0 +1,5 @@
+meshtastic>=2.2.0,<3.0.0
+pyserial>=3.5
+pyaudio>=0.2.11 # Note: May require system dependencies like portaudio-dev
+numpy>=1.19.0
+pypubsub>=4.0.3
