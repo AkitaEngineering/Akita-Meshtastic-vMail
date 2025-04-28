@@ -9,13 +9,13 @@ Settings are configurable via `config.json`.
 
 ---
 
-## 📬 Contact
+## Contact
 
 - **Email:** info@akitaengineering.com
 
 ---
 
-## 📜 License
+## License
 
 This software is licensed under the **GNU General Public License v3.0 (GPLv3)**.  
 License file not included in this package.  
@@ -23,7 +23,7 @@ Refer to: [GNU GPL v3 License](https://www.gnu.org/licenses/gpl-3.0.en.html)
 
 ---
 
-## 🚀 Features
+## Features
 
 - Record short voice messages.
 - Compress and send voice messages over Meshtastic.
@@ -38,7 +38,7 @@ Refer to: [GNU GPL v3 License](https://www.gnu.org/licenses/gpl-3.0.en.html)
 
 ---
 
-## 🛠️ Requirements
+## Requirements
 
 - Python 3.7+
 - Meshtastic device connected via USB/Serial or accessible via TCP (running recent firmware).
@@ -46,7 +46,7 @@ Refer to: [GNU GPL v3 License](https://www.gnu.org/licenses/gpl-3.0.en.html)
 
 ---
 
-## 📦 Installation
+## Installation
 
 ### 1. Create Project Directory
 ```bash
@@ -72,7 +72,7 @@ This is where recordings and received messages will be stored.
 5. (Optional) Edit Configuration
 Modify config.json to change default settings like the Meshtastic port number or chunking parameters if needed.
 
-🎙️ Usage
+Usage
 1. Connect your Meshtastic device via USB or ensure it's reachable via IP.
 
 2. Run the application:
