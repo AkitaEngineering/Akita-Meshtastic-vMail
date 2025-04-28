@@ -3,8 +3,10 @@
 From [Akita Engineering](https://www.akitaengineering.com)
 
 Akita vMail sets the standard for reliable voice communication over Meshtastic networks.  
-This robust Python application enables sending and receiving short voice messages using a connected Meshtastic device.  
-Engineered for resilience, this version incorporates CRC32 checksums for data integrity and a basic Acknowledgement (ACK) system for enhanced reliability of chunked messages, ensuring your voice gets through even in challenging network conditions.  
+This robust application enables sending and receiving short voice messages using a connected Meshtastic device.
+  
+Engineered for resilience, Akita vMail incorporates CRC32 checksums for data integrity and a basic Acknowledgement (ACK) system for enhanced reliability of chunked messages, ensuring your voice gets through even in challenging network conditions.  
+
 Settings are configurable via `config.json`.
 
 ---
