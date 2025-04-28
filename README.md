@@ -119,12 +119,12 @@ python main.py
 
 - Click the Clear Log button to empty the log output area.
 
-Protocol Details (v2 - CRC/ACK)
+### Protocol Details (v2 - CRC/ACK)
 - Messages use the Meshtastic port number defined in config.json (meshtastic_port_num, default 256).
 
 - Payloads are JSON formatted.
 
-Message Types
+### Message Types
 - complete_voice
 
 - voice_chunk
@@ -133,7 +133,7 @@ Message Types
 
 - test
 
-Complete Voice Messages
+### Complete Voice Messages
 - Contain:
 
 - - voice_data (base64 encoded compressed audio + header)
@@ -142,7 +142,7 @@ Complete Voice Messages
 
 - - crc32 checksum (calculated on the raw compressed audio + header)
 
-Chunked Messages
+### Chunked Messages
 Each chunk payload includes:
 
 - type: "voice_chunk"
@@ -157,7 +157,7 @@ Each chunk payload includes:
 
 - data (base64 encoded chunk data)
 
-Acknowledgements (ACKs)
+### Acknowledgements (ACKs)
 - Sent by receiver upon successful CRC validation of a voice_chunk.
 
 - Payload includes:
