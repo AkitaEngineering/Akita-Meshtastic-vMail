@@ -74,40 +74,40 @@ This is where recordings and received messages will be stored.
 ### 5. (Optional) Edit Configuration
 Modify config.json to change default settings like the Meshtastic port number or chunking parameters if needed.
 
-Usage
-1. Connect your Meshtastic device via USB or ensure it's reachable via IP.
+# Usage
+### 1. Connect your Meshtastic device via USB or ensure it's reachable via IP.
 
-2. Run the application:
+### 2. Run the application:
 ```bash
 python main.py
 ```
-3. In the GUI:
+### 3. In the GUI:
 
 - Enter/select the connection target (COM port or IP address).
 - Click Connect.
 - Check the log output for connection status and list of known nodes.
 - The status bar will show your node information upon connection.
 
-4. Adjust recording settings (Length, Quality, Chunk Size) via the GUI dropdowns/entries.
+### 4. Adjust recording settings (Length, Quality, Chunk Size) via the GUI dropdowns/entries.
 
-5. Record:
+### 5. Record:
 
 - Click 🎤 Record.
 - It will record for the specified duration or until you click ⏹ Stop Rec.
 
-6. Send:
+### 6. Send:
 
 - After recording, click ✉️ Send.
 - The message will be compressed, chunked (if needed), and sent.
 - Check the log for sending progress.
 
-7. Receive:
+### 7. Receive:
 
 - Incoming voice messages (chunked or complete) will appear in the "Messages" list after successful CRC validation.
 
 - Text messages will also appear.
 
-8. Playback:
+### 8. Playback:
 
 - Select a received voice message (🔊 icon).
 
@@ -115,7 +115,7 @@ python main.py
 
 - Use ⏹ Stop to halt playback.
 
-9. Clear Log:
+### 9. Clear Log:
 
 - Click the Clear Log button to empty the log output area.
 
