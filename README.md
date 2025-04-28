@@ -55,23 +55,23 @@ Refer to: [GNU GPL v3 License](https://www.gnu.org/licenses/gpl-3.0.en.html)
 mkdir akita_vmail
 cd akita_vmail
 ```
-2. Save Files
+### 2. Save Files
 Save all the provided code files (.py, .json, .txt) into the akita_vmail directory.
 
-3. Install Dependencies
+### 3. Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 Note: Installing PyAudio might require additional system dependencies (e.g., portaudio19-dev on Debian/Ubuntu or portaudio via Homebrew on macOS).
 Refer to the PyAudio documentation for your OS.
 
-4. Create Voice Message Directory
+### 4. Create Voice Message Directory
 ```bash
 mkdir voice_messages
 ```
 This is where recordings and received messages will be stored.
 
-5. (Optional) Edit Configuration
+### 5. (Optional) Edit Configuration
 Modify config.json to change default settings like the Meshtastic port number or chunking parameters if needed.
 
 Usage
