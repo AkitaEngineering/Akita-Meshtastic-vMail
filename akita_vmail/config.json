@@ -1,0 +1,23 @@
+{
+  "meshtastic_port_num": 256,
+  "chunking": {
+    "sizes": {
+      "Small": 150,
+      "Medium": 180,
+      "Large": 200
+    },
+    "default_key": "Medium",
+    "retry_count": 2,
+    "retry_delay_sec": 1.0,
+    "receive_timeout_sec": 60
+  },
+  "audio": {
+    "default_quality": "Low",
+    "default_length_sec": 3,
+    "quality_rates_hz": {
+        "Ultra Low": 4000,
+        "Very Low": 8000,
+        "Low": 11025
+    }
+  }
+}
