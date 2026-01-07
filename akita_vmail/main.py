@@ -43,6 +43,16 @@ def main():
     setup_basic_logging() # Setup console logging first
     logging.info("Starting Akita vMail application...")
 
+    # --- Load central configuration ---
+    try:
+        from utils import get_config, load_config
+        try:
+            config = get_config()
+        except Exception:
+            config = load_config()
+    except Exception:
+        config = {}
+
     # --- Initialize Tkinter ---
     # Use themed Tkinter if available
     try:
@@ -61,7 +71,7 @@ def main():
     # --- Create and Run the Application ---
     app = None # Define app variable outside try block
     try:
-        app = AkitaVmailApp(root) # Create instance of the main GUI class
+        app = AkitaVmailApp(root, config) # Create instance of the main GUI class with central config
         root.mainloop() # Start the Tkinter event loop
     except KeyboardInterrupt:
         logging.info("KeyboardInterrupt detected, initiating clean shutdown...")

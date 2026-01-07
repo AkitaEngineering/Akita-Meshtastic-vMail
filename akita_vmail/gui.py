@@ -20,13 +20,12 @@ from datetime import datetime
 # --- Import local modules ---
 try:
     # Utils now loads config first
-    from utils import log_to_gui, add_tooltip, setup_logging_queue, clear_scrolled_text, load_config
-    # Protocol loads config and defines constants based on it
+    from utils import log_to_gui, add_tooltip, setup_logging_queue, clear_scrolled_text, load_config, get_config
+    # Protocol exposes message types and runtime getters
     from protocol import (
-        PRIVATE_APP_PORT, CHUNK_SIZES, DEFAULT_CHUNK_SIZE_KEY, DEFAULT_CHUNK_SIZE,
-        CHUNK_TIMEOUT, MSG_TYPE_VOICE_CHUNK, MSG_TYPE_ACK,
+        MSG_TYPE_VOICE_CHUNK, MSG_TYPE_ACK,
         MSG_TYPE_TEST, MSG_TYPE_COMPLETE_VOICE, verify_chunk_crc,
-        verify_complete_voice_crc
+        verify_complete_voice_crc, get_chunk_sizes, get_default_chunk_size_key, get_default_chunk_size, get_chunk_timeout
     )
     # Audio handler also loads config for its defaults
     from audio_handler import AudioHandler
@@ -40,7 +39,7 @@ except ImportError as e:
 class AkitaVmailApp:
     """Main application class for the Akita vMail GUI."""
 
-    def __init__(self, master: tk.Tk):
+    def __init__(self, master: tk.Tk, config: dict | None = None):
         """Initialize the application."""
         self.master = master
         master.title("Akita vMail - Meshtastic Voice Messenger")
@@ -48,9 +47,21 @@ class AkitaVmailApp:
         master.minsize(650, 650)
 
         # --- Load Config ---
-        # Config is loaded by utils and used by protocol/audio_handler implicitly now
-        # We might need specific values here too
-        self.config = load_config()
+        # Prefer the config passed in from `main`; fallback to utils cached config
+        if config is None:
+            try:
+                from utils import get_config, load_config
+                try:
+                    self.config = get_config()
+                except Exception:
+                    self.config = load_config()
+            except Exception:
+                self.config = {}
+        else:
+            self.config = config
+
+        # Protocol getters will be called with `self.config` where needed.
+
         audio_cfg = self.config.get("audio", {})
         chunk_cfg = self.config.get("chunking", {})
 
@@ -59,8 +70,12 @@ class AkitaVmailApp:
         self.current_recording_path = None
         self.voice_messages = [] # List of dicts: {"description", "filepath", "from_id"}
         self.message_chunks = {} # Dict for reassembly: {chunk_id: {chunks, total, from_id, timestamp}}
-        # Get chunk size default from loaded config via protocol constants
-        self.max_chunk_size = DEFAULT_CHUNK_SIZE
+        # Get chunk size default from protocol getter
+        try:
+            from protocol import get_default_chunk_size
+            self.max_chunk_size = get_default_chunk_size(self.config)
+        except Exception:
+            self.max_chunk_size = 180
         self.log_queue = queue.Queue()
         self.connected_node_info = "N/A" # Store connected node info string
 
@@ -70,8 +85,9 @@ class AkitaVmailApp:
         self.master.after(100, self.process_log_queue)
 
         # --- Initialize Handlers ---
-        self.audio_handler = AudioHandler(self.log) # Gets config via its import
-        self.meshtastic_handler = MeshtasticHandler(self.log_queue, self.handle_received_message)
+        # Pass central config into handlers to avoid multiple independent loads
+        self.audio_handler = AudioHandler(self.log, config=self.config)
+        self.meshtastic_handler = MeshtasticHandler(self.log_queue, self.handle_received_message, config=self.config)
 
         # --- UI Styling ---
         self._setup_styles()
@@ -80,7 +96,12 @@ class AkitaVmailApp:
         self.create_widgets()
 
         # --- Periodic Tasks ---
-        chunk_timeout_ms = int(chunk_cfg.get("receive_timeout_sec", 60) * 1000)
+        try:
+            from protocol import get_chunk_timeout
+            timeout = get_chunk_timeout()
+        except Exception:
+            timeout = chunk_cfg.get("receive_timeout_sec", 60)
+        chunk_timeout_ms = int(timeout * 1000)
         self.master.after(chunk_timeout_ms, self.check_incomplete_chunks)
 
         # --- Cleanup on Close ---
@@ -207,9 +228,18 @@ class AkitaVmailApp:
         self.compression_quality_combo.grid(row=1, column=1, sticky=tk.W, padx=5, pady=3)
         add_tooltip(self.compression_quality_combo, "Audio quality vs compressed size")
         ttk.Label(recording_frame, text="Chunk Size:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=3)
-        self.chunk_size_var = tk.StringVar(value=DEFAULT_CHUNK_SIZE_KEY)
+        try:
+            from protocol import get_chunk_sizes, get_default_chunk_size_key
+            chunk_sizes = get_chunk_sizes(self.config)
+            default_chunk_key = get_default_chunk_size_key(self.config)
+            chunk_values = list(chunk_sizes.keys())
+        except Exception:
+            default_chunk_key = 'Medium'
+            chunk_values = ['Small', 'Medium', 'Large']
+
+        self.chunk_size_var = tk.StringVar(value=default_chunk_key)
         self.chunk_size_combo = ttk.Combobox(recording_frame, textvariable=self.chunk_size_var,
-                                            values=list(CHUNK_SIZES.keys()), width=10, state="readonly")
+                                            values=chunk_values, width=10, state="readonly")
         self.chunk_size_combo.grid(row=2, column=1, sticky=tk.W, padx=5, pady=3)
         self.chunk_size_combo.bind("<<ComboboxSelected>>", self.update_chunk_size)
         add_tooltip(self.chunk_size_combo, "Max network packet payload size")
@@ -786,17 +816,36 @@ class AkitaVmailApp:
         self.log("Closing application requested...")
         self.update_status("Closing...")
         self.master.protocol("WM_DELETE_WINDOW", lambda: None) # Disable close
-
-        # Give handlers a chance to finish current ops if possible
-        # (e.g., wait briefly if sending) - complex, skip for now
-
+        # Attempt to disconnect without freezing the UI. Poll for disconnect.
         if self.meshtastic_handler.is_connected:
             self.log("Disconnecting Meshtastic...")
-            self.meshtastic_handler.disconnect()
-            time.sleep(0.5) # Allow disconnect to process
+            try:
+                self.meshtastic_handler.disconnect()
+            except Exception as e:
+                self.log(f"Error initiating disconnect: {e}", logging.WARNING)
+            # Poll for up to 2 seconds for graceful disconnect
+            self.master.after(100, self._finish_close_after_disconnect, 0)
+        else:
+            self._finish_close()
 
-        self.log("Cleaning up audio resources...")
-        self.audio_handler.cleanup()
+    def _finish_close_after_disconnect(self, elapsed_ms: int):
+        """Poll until meshtastic handler is disconnected or timeout reached."""
+        if not self.meshtastic_handler.is_connected or elapsed_ms >= 2000:
+            self._finish_close()
+        else:
+            self.master.after(100, self._finish_close_after_disconnect, elapsed_ms + 100)
+
+    def _finish_close(self):
+        """Final cleanup and destroy the main window."""
+        try:
+            self.log("Cleaning up audio resources...")
+            self.audio_handler.cleanup()
+        except Exception as e:
+            self.log(f"Error during audio cleanup: {e}", logging.WARNING)
+        try:
+            self.master.destroy()
+        except Exception:
+            pass
 
         self.log("Destroying main window.")
         # Stop log queue polling? Not strictly necessary if window is destroyed.

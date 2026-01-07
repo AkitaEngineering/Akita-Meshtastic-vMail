@@ -24,22 +24,19 @@ DEFAULT_AUDIO_CONFIG = {
     "quality_rates_hz": {"Ultra Low": 4000, "Very Low": 8000, "Low": 11025}
 }
 
-# Import config loading utility
+# Import config loading utility (use lazy/cached get_config when available)
 try:
-    from utils import load_config
+    from utils import get_config, load_config
 except ImportError:
-    logging.critical("FATAL: Cannot import load_config from utils. Ensure utils.py is present.")
-    AUDIO_CONFIG = DEFAULT_AUDIO_CONFIG
-else:
-    # Load configuration
-    CONFIG = load_config()
-    AUDIO_CONFIG = CONFIG.get("audio", DEFAULT_AUDIO_CONFIG)  # Fallback if audio section missing
+    logging.critical("FATAL: Cannot import config helpers from utils. Ensure utils.py is present.")
+    get_config = None
+    load_config = None
 
 
 class AudioHandler:
     """Manages audio recording, playback, and processing."""
 
-    def __init__(self, log_callback: callable):
+    def __init__(self, log_callback: callable, config: dict | None = None):
         """
         Initialize the AudioHandler.
 
@@ -50,15 +47,30 @@ class AudioHandler:
         self.chunk = 1024       # Size of audio chunks read/written at a time
         self.format = pyaudio.paInt16 # Audio format (16-bit integers)
         self.channels = 1       # Mono audio
-        self.voice_message_dir = "voice_messages" # Directory to store recordings
+        # Determine config-driven values: prefer passed-in config, then cached loader
+        cfg = config
+        if cfg is None:
+            try:
+                cfg = get_config() if get_config else None
+            except Exception:
+                cfg = None
+        if cfg is None and load_config:
+            try:
+                cfg = load_config()
+            except Exception:
+                cfg = None
+
+        audio_section = (cfg or {}).get('audio', {}) if isinstance(cfg, dict) else {}
+        self.audio_section = audio_section
+        self.voice_message_dir = audio_section.get('voice_message_dir', "voice_messages")
 
         # --- Audio Quality Settings from Config ---
-        self.quality_rates = AUDIO_CONFIG.get("quality_rates_hz", DEFAULT_AUDIO_CONFIG["quality_rates_hz"])
-        self.default_quality = AUDIO_CONFIG.get("default_quality", DEFAULT_AUDIO_CONFIG["default_quality"])
+        self.quality_rates = audio_section.get("quality_rates_hz", DEFAULT_AUDIO_CONFIG["quality_rates_hz"]) 
+        self.default_quality = audio_section.get("default_quality", DEFAULT_AUDIO_CONFIG["default_quality"]) 
         # Ensure default quality exists in rates, else pick first available
-        if self.default_quality not in self.quality_rates and self.quality_rates:
-             self.default_quality = list(self.quality_rates.keys())[0]
-             self.log(f"Configured default quality '{AUDIO_CONFIG.get('default_quality')}' not found in rates. Using '{self.default_quality}'.", logging.WARNING)
+           if self.default_quality not in self.quality_rates and self.quality_rates:
+               self.default_quality = list(self.quality_rates.keys())[0]
+               self.log(f"Configured default quality '{audio_section.get('default_quality')}' not found in rates. Using '{self.default_quality}'.", logging.WARNING)
         elif not self.quality_rates: # Handle empty rates config
              self.quality_rates = DEFAULT_AUDIO_CONFIG["quality_rates_hz"]
              self.default_quality = DEFAULT_AUDIO_CONFIG["default_quality"]
@@ -67,7 +79,7 @@ class AudioHandler:
         self.rate = self.quality_rates.get(self.default_quality, 11025) # Current sample rate, fallback
 
         # --- Recording State from Config ---
-        self.record_seconds = AUDIO_CONFIG.get("default_length_sec", DEFAULT_AUDIO_CONFIG["default_length_sec"])
+        self.record_seconds = audio_section.get("default_length_sec", DEFAULT_AUDIO_CONFIG["default_length_sec"])
         self.recording = False  # Flag indicating if recording is active
         self.frames = []        # Buffer to store recorded audio frames
 
@@ -112,7 +124,7 @@ class AudioHandler:
             else:
                  self.record_seconds = rec_sec
         except ValueError:
-            default_len = AUDIO_CONFIG.get("default_length_sec", 3)
+            default_len = self.audio_section.get("default_length_sec", DEFAULT_AUDIO_CONFIG["default_length_sec"])
             self.log(f"Invalid recording length '{seconds_str}'. Using default {default_len}s.", logging.WARNING)
             self.record_seconds = default_len
 
@@ -196,7 +208,7 @@ class AudioHandler:
             return False
 
         self.recording = False # Signal the callback to complete
-        time.sleep(0.1) # Allow callback to process last chunk
+        time.sleep(0.05) # Small allow for last callback
 
         if self.stream:
             try:
@@ -477,7 +489,22 @@ class AudioHandler:
     def cleanup(self):
         """Clean up PyAudio resources upon application exit."""
         self.log("Cleaning up AudioHandler...")
-        if self.recording: self.stop_recording("dummy_cleanup.wav")
+        # If currently recording, stop and discard buffered frames (do NOT write temporary files)
+        if self.recording:
+            try:
+                self.recording = False
+                if self.stream:
+                    try:
+                        if self.stream.is_active(): self.stream.stop_stream()
+                        self.stream.close()
+                    except Exception:
+                        pass
+                    finally:
+                        self.stream = None
+                self.frames = []
+                self.log("Recording aborted during cleanup; frames discarded.")
+            except Exception as e:
+                self.log(f"Error aborting recording during cleanup: {e}", logging.WARNING)
         if self.playing: self.stop_playback()
 
         if self.p:

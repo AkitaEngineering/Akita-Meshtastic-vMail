@@ -13,8 +13,13 @@ import math
 import struct
 import logging
 
-# Import config loading utility
-# Default configuration used if `utils.load_config()` is unavailable
+# Import config loading utility (use cached getter when available)
+try:
+    from utils import get_config
+except Exception:
+    get_config = None
+
+# Default configuration used if `get_config()` is unavailable
 DEFAULT_CONFIG = {
     "meshtastic_port_num": 256,
     "chunking": {
@@ -26,31 +31,55 @@ DEFAULT_CONFIG = {
     }
 }
 
-try:
-    from utils import load_config
-except ImportError:
-    logging.critical("FATAL: Cannot import load_config from utils. Ensure utils.py is present.")
-    CONFIG = DEFAULT_CONFIG
-else:
-    # Load configuration
-    CONFIG = load_config()
+# The protocol module no longer stores config-bound module-level constants.
+# Callers should pass an explicit `config` dict into the getters below.
 
-# --- Constants from Config ---
-PRIVATE_APP_PORT = CONFIG.get("meshtastic_port_num", 256)
-CHUNK_CONFIG = CONFIG.get("chunking", DEFAULT_CONFIG["chunking"]) # Fallback if chunking section missing
-CHUNK_SIZES = CHUNK_CONFIG.get("sizes", DEFAULT_CONFIG["chunking"]["sizes"])
-DEFAULT_CHUNK_SIZE_KEY = CHUNK_CONFIG.get("default_key", DEFAULT_CONFIG["chunking"]["default_key"])
-# Ensure default key exists in sizes, else pick first available
-if DEFAULT_CHUNK_SIZE_KEY not in CHUNK_SIZES and CHUNK_SIZES:
-    DEFAULT_CHUNK_SIZE_KEY = list(CHUNK_SIZES.keys())[0]
-elif not CHUNK_SIZES: # Handle empty chunk sizes config
-     CHUNK_SIZES = DEFAULT_CONFIG["chunking"]["sizes"]
-     DEFAULT_CHUNK_SIZE_KEY = DEFAULT_CONFIG["chunking"]["default_key"]
 
-DEFAULT_CHUNK_SIZE = CHUNK_SIZES.get(DEFAULT_CHUNK_SIZE_KEY, 180) # Fallback size
-CHUNK_RETRY_COUNT = CHUNK_CONFIG.get("retry_count", DEFAULT_CONFIG["chunking"]["retry_count"])
-CHUNK_RETRY_DELAY = CHUNK_CONFIG.get("retry_delay_sec", DEFAULT_CONFIG["chunking"]["retry_delay_sec"])
-CHUNK_TIMEOUT = CHUNK_CONFIG.get("receive_timeout_sec", DEFAULT_CONFIG["chunking"]["receive_timeout_sec"])
+## Accessor functions for other modules to use (avoids importing constants at module import time)
+def get_private_app_port(config: dict | None = None) -> int:
+    """Return the configured private app port. If `config` is provided use it,
+    otherwise fall back to the last-refreshed module value.
+    """
+    if isinstance(config, dict):
+        return config.get("meshtastic_port_num", DEFAULT_CONFIG.get("meshtastic_port_num", 256))
+    return PRIVATE_APP_PORT
+
+def get_chunk_sizes(config: dict | None = None) -> dict:
+    if isinstance(config, dict):
+        return config.get("chunking", DEFAULT_CONFIG["chunking"]).get("sizes", DEFAULT_CONFIG["chunking"]["sizes"])
+    return CHUNK_SIZES
+
+def get_default_chunk_size_key(config: dict | None = None) -> str:
+    if isinstance(config, dict):
+        chunk_cfg = config.get("chunking", DEFAULT_CONFIG["chunking"]) or DEFAULT_CONFIG["chunking"]
+        key = chunk_cfg.get("default_key", DEFAULT_CONFIG["chunking"]["default_key"])
+        sizes = chunk_cfg.get("sizes", DEFAULT_CONFIG["chunking"]["sizes"]) or DEFAULT_CONFIG["chunking"]["sizes"]
+        if key not in sizes and sizes:
+            return list(sizes.keys())[0]
+        return key
+    return DEFAULT_CHUNK_SIZE_KEY
+
+def get_default_chunk_size(config: dict | None = None) -> int:
+    if isinstance(config, dict):
+        sizes = get_chunk_sizes(config)
+        key = get_default_chunk_size_key(config)
+        return sizes.get(key, 180)
+    return DEFAULT_CHUNK_SIZE
+
+def get_chunk_retry_count(config: dict | None = None) -> int:
+    if isinstance(config, dict):
+        return config.get("chunking", DEFAULT_CONFIG["chunking"]).get("retry_count", DEFAULT_CONFIG["chunking"]["retry_count"])
+    return CHUNK_RETRY_COUNT
+
+def get_chunk_retry_delay(config: dict | None = None) -> float:
+    if isinstance(config, dict):
+        return config.get("chunking", DEFAULT_CONFIG["chunking"]).get("retry_delay_sec", DEFAULT_CONFIG["chunking"]["retry_delay_sec"])
+    return CHUNK_RETRY_DELAY
+
+def get_chunk_timeout(config: dict | None = None) -> int:
+    if isinstance(config, dict):
+        return config.get("chunking", DEFAULT_CONFIG["chunking"]).get("receive_timeout_sec", DEFAULT_CONFIG["chunking"]["receive_timeout_sec"])
+    return CHUNK_TIMEOUT
 
 # --- Other Constants ---
 BROADCAST_ADDR = "^all"     # Meshtastic broadcast address alias
@@ -199,8 +228,21 @@ def split_data_into_chunks(data: bytes, max_chunk_payload_size: int) -> list[byt
     Splits raw byte data into multiple smaller byte chunks suitable for sending.
     Aims to ensure the *final JSON payload* for each chunk does not exceed limit.
     """
-    # Heuristic value for fixed JSON overhead (keys, static values, structure)
-    json_fixed_overhead = 150 # bytes (adjust as needed)
+    # Dynamically estimate JSON fixed overhead by serializing a sample payload
+    # that includes all keys except the base64 data. This provides a safer
+    # estimate than a hardcoded constant.
+    try:
+        sample_payload = {
+            "type": MSG_TYPE_VOICE_CHUNK,
+            "chunk_id": "00000000",
+            "chunk_num": 1,
+            "total_chunks": 1,
+            "crc32": 0,
+            "data": ""  # empty data to measure fixed overhead
+        }
+        json_fixed_overhead = len(json.dumps(sample_payload).encode('utf-8'))
+    except Exception:
+        json_fixed_overhead = 150
 
     max_b64_data_size = max_chunk_payload_size - json_fixed_overhead
     if max_b64_data_size <= 10:
@@ -235,7 +277,5 @@ def split_data_into_chunks(data: bytes, max_chunk_payload_size: int) -> list[byt
     logging.debug(f"Data length {len(data)} split into {len(chunks)} chunks.")
     return chunks
 
-# Log the loaded configuration values for verification
-logging.info(f"Protocol using Port: {PRIVATE_APP_PORT}, Default Chunk Key: {DEFAULT_CHUNK_SIZE_KEY}, "
-             f"Retries: {CHUNK_RETRY_COUNT}, Timeout: {CHUNK_TIMEOUT}")
+logging.info("Protocol module loaded. Use getters with explicit config dict to access runtime values.")
 

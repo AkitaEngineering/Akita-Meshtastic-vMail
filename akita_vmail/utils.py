@@ -11,6 +11,8 @@ import logging
 import logging.handlers # Required for QueueHandler
 import json
 import os
+import collections.abc
+import copy
 
 # --- Configuration Loading ---
 
@@ -30,20 +32,31 @@ DEFAULT_CONFIG = {
     }
 }
 
+def _recursive_update(d, u):
+    """Recursively update a dictionary."""
+    for k, v in u.items():
+        if isinstance(v, collections.abc.Mapping):
+            d[k] = _recursive_update(d.get(k, {}), v)
+        else:
+            d[k] = v
+    return d
+
+_CACHED_CONFIG = None
+
 def load_config(config_path="config.json") -> dict:
-    """Loads configuration from a JSON file, falling back to defaults."""
-    config = DEFAULT_CONFIG.copy() # Start with defaults
+    """
+    Loads configuration from a JSON file, falling back to defaults.
+    Performs a recursive merge of the loaded config onto the defaults.
+    Creates a default config file if one doesn't exist.
+    """
+    config = copy.deepcopy(DEFAULT_CONFIG) # Start with a deep copy of defaults
+
     if os.path.exists(config_path):
         try:
             with open(config_path, 'r') as f:
                 loaded_config = json.load(f)
-                # Basic validation/merging (could be more sophisticated)
-                config.update(loaded_config) # Overwrite defaults with loaded values
-                # Ensure nested dictionaries are also updated correctly if needed
-                for key in DEFAULT_CONFIG:
-                    if isinstance(DEFAULT_CONFIG[key], dict) and key in loaded_config:
-                        config[key].update(loaded_config[key])
-                logging.info(f"Successfully loaded configuration from {config_path}")
+                config = _recursive_update(config, loaded_config)
+                logging.info(f"Successfully loaded and merged configuration from {config_path}")
         except json.JSONDecodeError as e:
             logging.error(f"Error decoding JSON from {config_path}: {e}. Using default configuration.")
             config = DEFAULT_CONFIG.copy() # Revert to defaults on error
@@ -51,15 +64,26 @@ def load_config(config_path="config.json") -> dict:
             logging.error(f"Error loading configuration file {config_path}: {e}. Using default configuration.")
             config = DEFAULT_CONFIG.copy() # Revert to defaults on error
     else:
-        logging.warning(f"Configuration file {config_path} not found. Using default configuration.")
-        # Optionally create a default config file here
-        # try:
-        #     with open(config_path, 'w') as f:
-        #         json.dump(DEFAULT_CONFIG, f, indent=2)
-        #     logging.info(f"Created default configuration file at {config_path}")
-        # except Exception as e:
-        #     logging.error(f"Could not create default configuration file: {e}")
+        logging.warning(f"Configuration file '{config_path}' not found. Using defaults and creating a new one.")
+        try:
+            with open(config_path, 'w') as f:
+                json.dump(DEFAULT_CONFIG, f, indent=2)
+            logging.info(f"Created default configuration file at {config_path}")
+        except Exception as e:
+            logging.error(f"Could not create default configuration file: {e}")
     return config
+
+
+def get_config(config_path="config.json") -> dict:
+    """
+    Return a cached configuration dictionary. The file is read only once per process
+    and subsequent calls return the same object. Callers that need fresh reloads
+    should call `load_config` directly.
+    """
+    global _CACHED_CONFIG
+    if _CACHED_CONFIG is None:
+        _CACHED_CONFIG = load_config(config_path)
+    return _CACHED_CONFIG
 
 # --- Logging Setup ---
 

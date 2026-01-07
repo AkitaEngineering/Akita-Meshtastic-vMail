@@ -1,0 +1,1 @@
+# akita_vmail package

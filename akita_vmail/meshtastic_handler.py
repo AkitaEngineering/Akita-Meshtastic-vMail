@@ -19,16 +19,15 @@ import threading
 import logging
 import queue
 
-# Import protocol definitions (which load config)
+# Import protocol helpers (use runtime getters to avoid module-level constant binding)
 try:
     from protocol import (
-        PRIVATE_APP_PORT, BROADCAST_ADDR, CHUNK_RETRY_COUNT,
-        CHUNK_RETRY_DELAY, create_chunk_payload, create_ack_payload,
+        BROADCAST_ADDR, create_chunk_payload, create_ack_payload,
         create_test_payload, create_complete_voice_payload,
         parse_payload, verify_chunk_crc, verify_complete_voice_crc,
         split_data_into_chunks, generate_unique_id,
         MSG_TYPE_VOICE_CHUNK, MSG_TYPE_ACK, MSG_TYPE_TEST,
-        MSG_TYPE_COMPLETE_VOICE
+        MSG_TYPE_COMPLETE_VOICE, get_private_app_port, get_chunk_retry_count, get_chunk_retry_delay
     )
 except ImportError as e:
      logging.critical(f"FATAL: Cannot import from protocol module: {e}. Ensure protocol.py is present.")
@@ -39,7 +38,7 @@ except ImportError as e:
 class MeshtasticHandler:
     """Manages connection and communication with a Meshtastic device."""
 
-    def __init__(self, log_queue: queue.Queue, receive_callback: callable):
+    def __init__(self, log_queue: queue.Queue, receive_callback: callable, config: dict | None = None):
         """
         Initialize the MeshtasticHandler.
 
@@ -50,6 +49,16 @@ class MeshtasticHandler:
         """
         self.log_queue = log_queue
         self.receive_callback = receive_callback
+        # Store provided config (fallback to cached config loader if not provided)
+        self.config = config
+        if self.config is None:
+            try:
+                from utils import get_config
+                self.config = get_config() if get_config else {}
+            except Exception:
+                self.config = {}
+
+        # Configuration is passed to protocol getters where needed; no module-level refresh.
         self.interface: meshtastic.MeshInterface | None = None # Type hint for clarity
         self.is_connected = False
         self.sending_active = False
@@ -250,10 +259,16 @@ class MeshtasticHandler:
         """Internal callback for raw Meshtastic packets received via pubsub."""
         try:
             if not packet: return
-            # Optional: Ignore loopback packets
-            # if self.interface and self.interface.myInfo and packet.get('from') == self.interface.myInfo.my_node_num:
-            #      # self.log("Ignoring loopback packet.", logging.DEBUG)
-            #      return
+            # Optional: Ignore loopback packets based on config (default: True)
+            try:
+                from utils import get_config
+                cfg = get_config() if get_config else {}
+            except Exception:
+                cfg = {}
+            ignore_loopback = cfg.get('meshtastic', {}).get('ignore_loopback', True)
+            if ignore_loopback and self.interface and getattr(self.interface, 'myInfo', None) and packet.get('from') == self.interface.myInfo.my_node_num:
+                self.log("Ignoring loopback packet.", logging.DEBUG)
+                return
 
             decoded_packet = packet.get('decoded')
             if not decoded_packet: return
@@ -267,7 +282,11 @@ class MeshtasticHandler:
             snr = packet.get('rxSnr', 'N/A')
 
             # 1. Our Custom App Data
-            if str(portnum) == str(PRIVATE_APP_PORT) and payload:
+            try:
+                target_port = get_private_app_port(self.config)
+            except Exception:
+                target_port = None
+            if target_port is not None and str(portnum) == str(target_port) and payload:
                 self.log(f"Received App Data (Port {portnum}) from {from_id_hex} [RSSI:{rssi} SNR:{snr} ID:{packet_id}] ({len(payload)} bytes)", logging.INFO)
                 parsed_data = parse_payload(payload)
                 if parsed_data:
@@ -290,7 +309,7 @@ class MeshtasticHandler:
 
 
     def send_data(self, payload_bytes: bytes, description: str = "data") -> bool:
-        """Sends a single data payload over Meshtastic using the PRIVATE_APP_PORT."""
+        """Sends a single data payload over Meshtastic using the configured private app port."""
         if not self.is_connected or not self.interface:
             self.log("Cannot send: Not connected.", logging.ERROR)
             return False
@@ -306,10 +325,11 @@ class MeshtasticHandler:
         success = False
         try:
             self.log(f"Sending {description} ({len(payload_bytes)} bytes)...")
+            portnum = get_private_app_port()
             self.interface.sendData(
                 payload_bytes,
                 destinationId=BROADCAST_ADDR,
-                portNum=PRIVATE_APP_PORT,
+                portNum=portnum,
                 wantAck=True,
                 channelIndex=0
             )
@@ -356,12 +376,21 @@ class MeshtasticHandler:
                 payload_bytes = create_chunk_payload(chunk_id, chunk_num, total_chunks, chunk_data)
                 send_success_this_chunk = False
 
-                for attempt in range(CHUNK_RETRY_COUNT + 1):
+                # Get retry configuration from protocol
+                    try:
+                        retry_count = get_chunk_retry_count(self.config)
+                        retry_delay = get_chunk_retry_delay(self.config)
+                    except Exception:
+                        retry_count = 2
+                        retry_delay = 1.0
+
+                for attempt in range(retry_count + 1):
                     self.log(f"Sending chunk {chunk_num}/{total_chunks} (ID:{chunk_id}, Attempt {attempt+1})...")
                     try:
+                        portnum = get_private_app_port(self.config)
                         self.interface.sendData(
                             payload_bytes, destinationId=BROADCAST_ADDR,
-                            portNum=PRIVATE_APP_PORT, wantAck=True
+                            portNum=portnum, wantAck=True
                         )
                         self.log(f"Chunk {chunk_num} send command issued.")
                         send_success_this_chunk = True
@@ -371,12 +400,12 @@ class MeshtasticHandler:
                     except Exception as e:
                         self.log(f"Unexpected error sending chunk {chunk_num} (Attempt {attempt+1}): {e}", logging.WARNING)
 
-                    if attempt < CHUNK_RETRY_COUNT:
-                        self.log(f"Waiting {CHUNK_RETRY_DELAY}s before retrying chunk {chunk_num}...")
-                        time.sleep(CHUNK_RETRY_DELAY)
+                    if attempt < retry_count:
+                        self.log(f"Waiting {retry_delay}s before retrying chunk {chunk_num}...")
+                        time.sleep(retry_delay)
 
                 if not send_success_this_chunk:
-                    self.log(f"Failed to send chunk {chunk_num} (ID:{chunk_id}) after {CHUNK_RETRY_COUNT + 1} attempts. Aborting message.", logging.ERROR)
+                    self.log(f"Failed to send chunk {chunk_num} (ID:{chunk_id}) after {retry_count + 1} attempts. Aborting message.", logging.ERROR)
                     return False # Abort sending
 
                 # Wait between chunks
@@ -425,10 +454,11 @@ class MeshtasticHandler:
         try:
             payload_bytes = create_ack_payload(chunk_id, chunk_num)
             self.log(f"Sending ACK for chunk {chunk_num} (ID:{chunk_id}) to {destination_id}", logging.DEBUG)
+            portnum = get_private_app_port(self.config)
             self.interface.sendData(
                 payload_bytes,
                 destinationId=dest_node_num, # Send unicast ACK using node number
-                portNum=PRIVATE_APP_PORT,
+                portNum=portnum,
                 wantAck=False # Don't request ACK for an ACK
             )
             return True
