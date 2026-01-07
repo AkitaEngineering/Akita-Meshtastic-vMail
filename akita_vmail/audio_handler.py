@@ -15,23 +15,25 @@ import struct       # For packing/unpacking header data
 import numpy as np  # For numerical operations (dynamic range compression)
 import logging      # For logging messages
 from datetime import datetime # For timestamps in filenames
+import uuid        # For unique filename suffixes
+
+# Default audio config used if `utils.load_config()` is unavailable or incomplete
+DEFAULT_AUDIO_CONFIG = {
+    "default_quality": "Low",
+    "default_length_sec": 3,
+    "quality_rates_hz": {"Ultra Low": 4000, "Very Low": 8000, "Low": 11025}
+}
 
 # Import config loading utility
 try:
     from utils import load_config
 except ImportError:
     logging.critical("FATAL: Cannot import load_config from utils. Ensure utils.py is present.")
-    # Define fallback defaults directly here if utils is missing (less ideal)
-    DEFAULT_AUDIO_CONFIG = {
-        "default_quality": "Low",
-        "default_length_sec": 3,
-        "quality_rates_hz": {"Ultra Low": 4000, "Very Low": 8000, "Low": 11025}
-    }
     AUDIO_CONFIG = DEFAULT_AUDIO_CONFIG
 else:
     # Load configuration
     CONFIG = load_config()
-    AUDIO_CONFIG = CONFIG.get("audio", DEFAULT_AUDIO_CONFIG) # Fallback if audio section missing
+    AUDIO_CONFIG = CONFIG.get("audio", DEFAULT_AUDIO_CONFIG)  # Fallback if audio section missing
 
 
 class AudioHandler:

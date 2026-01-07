@@ -14,21 +14,22 @@ import struct
 import logging
 
 # Import config loading utility
+# Default configuration used if `utils.load_config()` is unavailable
+DEFAULT_CONFIG = {
+    "meshtastic_port_num": 256,
+    "chunking": {
+        "sizes": {"Small": 150, "Medium": 180, "Large": 200},
+        "default_key": "Medium",
+        "retry_count": 2,
+        "retry_delay_sec": 1.0,
+        "receive_timeout_sec": 60
+    }
+}
+
 try:
     from utils import load_config
 except ImportError:
     logging.critical("FATAL: Cannot import load_config from utils. Ensure utils.py is present.")
-    # Define fallback defaults directly here if utils is missing (less ideal)
-    DEFAULT_CONFIG = {
-        "meshtastic_port_num": 256,
-        "chunking": {
-            "sizes": {"Small": 150, "Medium": 180, "Large": 200},
-            "default_key": "Medium",
-            "retry_count": 2,
-            "retry_delay_sec": 1.0,
-            "receive_timeout_sec": 60
-        }
-    }
     CONFIG = DEFAULT_CONFIG
 else:
     # Load configuration

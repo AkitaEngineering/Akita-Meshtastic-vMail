@@ -81,98 +81,116 @@ Modify config.json to change default settings like the Meshtastic port number or
 ```bash
 python main.py
 ```
-### 3. In the GUI:
+# Akita vMail - Meshtastic Voice Messenger
 
-- Enter/select the connection target (COM port or IP address).
-- Click Connect.
-- Check the log output for connection status and list of known nodes.
-- The status bar will show your node information upon connection.
+From [Akita Engineering](https://www.akitaengineering.com)
 
-### 4. Adjust recording settings (Length, Quality, Chunk Size) via the GUI dropdowns/entries.
+Akita vMail enables sending and receiving short voice messages over Meshtastic networks using a GUI-based desktop app. It supports chunked transfers with CRC32 checks and simple ACKs to improve reliability on lossy mesh links.
 
-### 5. Record:
+Configuration is provided via [config.json](akita_vmail/config.json) and runtime data is stored in a `voice_messages` directory by default.
 
-- Click 🎤 Record.
-- It will record for the specified duration or until you click ⏹ Stop Rec.
+---
 
-### 6. Send:
+**Contact**: info@akitaengineering.com
 
-- After recording, click ✉️ Send.
-- The message will be compressed, chunked (if needed), and sent.
-- Check the log for sending progress.
+---
 
-### 7. Receive:
+## License
 
-- Incoming voice messages (chunked or complete) will appear in the "Messages" list after successful CRC validation.
+This project is licensed under the GNU GPL v3.0. See the included [LICENSE](LICENSE) file for details.
 
-- Text messages will also appear.
+---
 
-### 8. Playback:
+## Highlights
 
-- Select a received voice message (🔊 icon).
+- Record and play short voice messages
+- Compress and transmit messages over Meshtastic
+- Chunking for larger payloads with CRC32 validation
+- ACKs for chunk confirmation, GUI built with Tkinter
+- Configurable audio quality, recording length, and chunk size
 
-- Click ▶ Play.
+---
 
-- Use ⏹ Stop to halt playback.
+## Requirements
 
-### 9. Clear Log:
+- Python 3.8+ recommended
+- A Meshtastic device (USB/Serial) or a reachable Meshtastic TCP endpoint
+- See `akita_vmail/requirements.txt` for Python package dependencies
 
-- Click the Clear Log button to empty the log output area.
+Notable packages: `meshtastic`, `pyserial`, `pyaudio`, `numpy`, `pypubsub`.
 
-### Protocol Details (v2 - CRC/ACK)
-- Messages use the Meshtastic port number defined in config.json (meshtastic_port_num, default 256).
+---
 
-- Payloads are JSON formatted.
+## Quick Setup (Linux-first)
 
-### Message Types
-- complete_voice
+1. Clone the repository and open a terminal in the project root.
 
-- voice_chunk
+2. Create and activate a Python virtual environment (recommended):
 
-- ack
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
 
-- test
+3. Install system packages required for audio and building native extensions (Debian/Ubuntu example):
 
-### Complete Voice Messages
-- Contain:
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential portaudio19-dev libsndfile1 libasound2-dev
+```
 
-- - voice_data (base64 encoded compressed audio + header)
+4. Install Python dependencies into the activated venv:
 
-- - timestamp
+```bash
+python3 -m pip install --upgrade pip
+python3 -m pip install -r akita_vmail/requirements.txt
+```
 
-- - crc32 checksum (calculated on the raw compressed audio + header)
+Note: On many Linux distributions `pyaudio` must be compiled against `portaudio` (installed above). If `pyaudio` fails to install, install `portaudio19-dev` (Debian/Ubuntu) or the equivalent package for your distro, then re-run the `pip install` command.
 
-### Chunked Messages
-Each chunk payload includes:
+5. Create the recordings storage directory (if not already present):
 
-- type: "voice_chunk"
+```bash
+mkdir -p voice_messages
+```
 
-- chunk_id
+6. (Optional) Edit `akita_vmail/config.json` to change defaults such as `meshtastic_port_num`, chunk sizes, and audio quality.
 
-- chunk_num
+> Windows users: If you're on Windows you can still follow the above steps but use PowerShell for the venv activation. Installing `pyaudio` on Windows is often easiest with `pipwin`:
 
-- total_chunks
+```powershell
+python -m pip install pipwin
+python -m pipwin install pyaudio
+```
 
-- crc32 (calculated on raw chunk data before base64 encoding)
+---
 
-- data (base64 encoded chunk data)
+## Run the App
 
-### Acknowledgements (ACKs)
-- Sent by receiver upon successful CRC validation of a voice_chunk.
+Run from the project root with the venv Python (or after activating the venv):
 
-- Payload includes:
+```powershell
+python akita_vmail/main.py
+```
 
--- type: "ack"
+Alternatively, change directory into `akita_vmail` and run `python main.py`.
 
--- ack_id (matching the chunk_id)
+---
 
--- chunk_num
+## Troubleshooting
 
-- ACKs are sent directly back to the original sender.
+- If imports fail for `pyaudio` or `meshtastic`, ensure the packages are installed in the active environment. For `pyaudio` on Windows, prefer `pipwin` as shown above.
+- If the Meshtastic device isn't detected, verify the COM port in Device Manager (Windows) or use `ls /dev/tty*` on Unix. The GUI accepts COM names (e.g., `COM3`) or IP addresses for TCP connections.
+- Logs appear in the GUI log pane; enable console logging by running without a frozen/bundled executable.
 
-⚠️ Disclaimer
-This is experimental software provided by Akita Engineering. Use it at your own risk.
-Network performance, reliability, and successful message delivery depend heavily on Meshtastic network conditions (distance, obstructions, node density, channel utilization).
-The ACK mechanism confirms chunk reception by the next hop or end device, but it does not guarantee successful reassembly if other chunks are lost.
+---
+
+## Development Notes
+
+- The GUI lives in `akita_vmail/gui.py`.
+- Audio logic is in `akita_vmail/audio_handler.py` and protocol helpers are in `akita_vmail/protocol.py`.
+- If you modify config loading, see `akita_vmail/utils.py` for the `load_config()` helper.
+
+
 
 

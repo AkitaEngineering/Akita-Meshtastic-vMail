@@ -12,6 +12,8 @@ import meshtastic.tcp_interface
 import meshtastic.util
 from pubsub import pub
 import serial.tools.list_ports
+import serial
+from datetime import datetime
 import time
 import threading
 import logging
