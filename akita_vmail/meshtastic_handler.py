@@ -49,14 +49,8 @@ class MeshtasticHandler:
         """
         self.log_queue = log_queue
         self.receive_callback = receive_callback
-        # Store provided config (fallback to cached config loader if not provided)
-        self.config = config
-        if self.config is None:
-            try:
-                from utils import get_config
-                self.config = get_config() if get_config else {}
-            except Exception:
-                self.config = {}
+        # Store provided config (do not load config at import time; use injected config)
+        self.config = config or {}
 
         # Configuration is passed to protocol getters where needed; no module-level refresh.
         self.interface: meshtastic.MeshInterface | None = None # Type hint for clarity
@@ -259,13 +253,8 @@ class MeshtasticHandler:
         """Internal callback for raw Meshtastic packets received via pubsub."""
         try:
             if not packet: return
-            # Optional: Ignore loopback packets based on config (default: True)
-            try:
-                from utils import get_config
-                cfg = get_config() if get_config else {}
-            except Exception:
-                cfg = {}
-            ignore_loopback = cfg.get('meshtastic', {}).get('ignore_loopback', True)
+            # Optional: Ignore loopback packets based on injected config (default: True)
+            ignore_loopback = self.config.get('meshtastic', {}).get('ignore_loopback', True)
             if ignore_loopback and self.interface and getattr(self.interface, 'myInfo', None) and packet.get('from') == self.interface.myInfo.my_node_num:
                 self.log("Ignoring loopback packet.", logging.DEBUG)
                 return
@@ -325,7 +314,7 @@ class MeshtasticHandler:
         success = False
         try:
             self.log(f"Sending {description} ({len(payload_bytes)} bytes)...")
-            portnum = get_private_app_port()
+            portnum = get_private_app_port(self.config)
             self.interface.sendData(
                 payload_bytes,
                 destinationId=BROADCAST_ADDR,
@@ -377,12 +366,12 @@ class MeshtasticHandler:
                 send_success_this_chunk = False
 
                 # Get retry configuration from protocol
-                    try:
-                        retry_count = get_chunk_retry_count(self.config)
-                        retry_delay = get_chunk_retry_delay(self.config)
-                    except Exception:
-                        retry_count = 2
-                        retry_delay = 1.0
+                try:
+                    retry_count = get_chunk_retry_count(self.config)
+                    retry_delay = get_chunk_retry_delay(self.config)
+                except Exception:
+                    retry_count = 2
+                    retry_delay = 1.0
 
                 for attempt in range(retry_count + 1):
                     self.log(f"Sending chunk {chunk_num}/{total_chunks} (ID:{chunk_id}, Attempt {attempt+1})...")

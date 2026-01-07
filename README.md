@@ -23,174 +23,154 @@ This software is licensed under the **GNU General Public License v3.0 (GPLv3)**.
 License file not included in this package.  
 Refer to: [GNU GPL v3 License](https://www.gnu.org/licenses/gpl-3.0.en.html)
 
----
 
-## Features
-
-- Record short voice messages.
-- Compress and send voice messages over Meshtastic.
-- Receive and play voice messages.
-- Message chunking for larger messages.
-- CRC32 checksums for data integrity on chunks and complete messages.
-- Basic Acknowledgement (ACK) for received chunks (receiver sends ACK upon successful CRC validation).
-- Adjustable audio quality and network chunk size via GUI.
-- External configuration via `config.json`.
-- Simple GUI built with Tkinter, including a log clear button.
-- Logs known mesh nodes upon connection.
-
----
-
-## Requirements
-
-- Python 3.7+
-- Meshtastic device connected via USB/Serial or accessible via TCP (running recent firmware).
-- Required Python libraries (see `requirements.txt`).
-
----
-
-## Installation
-
-### 1. Create Project Directory
-```bash
-mkdir akita_vmail
-cd akita_vmail
-```
-### 2. Save Files
-Save all the provided code files (.py, .json, .txt) into the akita_vmail directory.
-
-### 3. Install Dependencies
-```bash
-pip install -r requirements.txt
-```
-Note: Installing PyAudio might require additional system dependencies (e.g., portaudio19-dev on Debian/Ubuntu or portaudio via Homebrew on macOS).
-Refer to the PyAudio documentation for your OS.
-
-### 4. Create Voice Message Directory
-```bash
-mkdir voice_messages
-```
-This is where recordings and received messages will be stored.
-
-### 5. (Optional) Edit Configuration
-Modify config.json to change default settings like the Meshtastic port number or chunking parameters if needed.
-
-# Usage
-### 1. Connect your Meshtastic device via USB or ensure it's reachable via IP.
-
-### 2. Run the application:
-```bash
-python main.py
-```
 # Akita vMail - Meshtastic Voice Messenger
 
 From [Akita Engineering](https://www.akitaengineering.com)
 
-Akita vMail enables sending and receiving short voice messages over Meshtastic networks using a GUI-based desktop app. It supports chunked transfers with CRC32 checks and simple ACKs to improve reliability on lossy mesh links.
+Akita vMail is a desktop application for sending and receiving short voice
+messages over Meshtastic networks. The project focuses on resilience and
+observability: messages include CRC32 checks for integrity and a simple ACK
+scheme to support chunked transfers over lossy links.
 
-Configuration is provided via [config.json](akita_vmail/config.json) and runtime data is stored in a `voice_messages` directory by default.
-
----
-
-**Contact**: info@akitaengineering.com
-
----
-
-## License
-
-This project is licensed under the GNU GPL v3.0. See the included [LICENSE](LICENSE) file for details.
+This repository contains the application code (under `akita_vmail/`),
+configuration defaults, and a small test suite. The GUI uses Tkinter and the
+core code is written for Python 3.8+.
 
 ---
 
-## Highlights
+## What's changed (recent refactor)
 
-- Record and play short voice messages
-- Compress and transmit messages over Meshtastic
-- Chunking for larger payloads with CRC32 validation
-- ACKs for chunk confirmation, GUI built with Tkinter
-- Configurable audio quality, recording length, and chunk size
-
----
-
-## Requirements
-
-- Python 3.8+ recommended
-- A Meshtastic device (USB/Serial) or a reachable Meshtastic TCP endpoint
-- See `akita_vmail/requirements.txt` for Python package dependencies
-
-Notable packages: `meshtastic`, `pyserial`, `pyaudio`, `numpy`, `pypubsub`.
+- Centralized configuration loader in `akita_vmail/utils.py` with a cached
+	`get_config()` and a recursive merge on `load_config()`.
+- Protocol constants moved out of import-time module state; use the
+	config-aware getters in `akita_vmail/protocol.py` (e.g. `get_chunk_sizes(config)`).
+- Dependency injection: `AudioHandler`, `MeshtasticHandler`, and the GUI
+	receive an explicit `config` dict instead of loading globals at import time.
+- GUI decomposed into smaller components under `akita_vmail/` (e.g.
+	`connection_panel.py`, `recording_panel.py`, `controls_panel.py`, etc.) and
+	`style_helper.py` centralizes theme/styling.
+- Fail-fast imports: components use explicit package-relative imports so
+	missing modules surface at startup (no silent fallback imports remain).
 
 ---
 
-## Quick Setup (Linux-first)
+## Quickstart (developer / local run)
 
-1. Clone the repository and open a terminal in the project root.
-
-2. Create and activate a Python virtual environment (recommended):
+1. Create and activate a virtual environment (recommended):
 
 ```bash
-python3 -m venv .venv
+python -m venv .venv
+# Unix/macOS
 source .venv/bin/activate
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
 ```
 
-3. Install system packages required for audio and building native extensions (Debian/Ubuntu example):
+2. Install Python dependencies:
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y build-essential portaudio19-dev libsndfile1 libasound2-dev
+python -m pip install --upgrade pip
+python -m pip install -r akita_vmail/requirements.txt
 ```
 
-4. Install Python dependencies into the activated venv:
-
-```bash
-python3 -m pip install --upgrade pip
-python3 -m pip install -r akita_vmail/requirements.txt
-```
-
-Note: On many Linux distributions `pyaudio` must be compiled against `portaudio` (installed above). If `pyaudio` fails to install, install `portaudio19-dev` (Debian/Ubuntu) or the equivalent package for your distro, then re-run the `pip install` command.
-
-5. Create the recordings storage directory (if not already present):
+3. Ensure a directory exists for voice files (defaults to `voice_messages`):
 
 ```bash
 mkdir -p voice_messages
 ```
 
-6. (Optional) Edit `akita_vmail/config.json` to change defaults such as `meshtastic_port_num`, chunk sizes, and audio quality.
+4. (Optional) Edit `config.json` in the project root to change defaults.
 
-> Windows users: If you're on Windows you can still follow the above steps but use PowerShell for the venv activation. Installing `pyaudio` on Windows is often easiest with `pipwin`:
+5. Run the application from the repository root:
 
-```powershell
-python -m pip install pipwin
-python -m pipwin install pyaudio
-```
-
----
-
-## Run the App
-
-Run from the project root with the venv Python (or after activating the venv):
-
-```powershell
+```bash
+python -m akita_vmail.main
+# or
 python akita_vmail/main.py
 ```
 
-Alternatively, change directory into `akita_vmail` and run `python main.py`.
+Notes:
+- On Windows, installing `pyaudio` may be easier via `pipwin`.
+- Running the GUI headlessly (in CI) requires mocking audio and meshtastic
+	dependencies; the test suite already includes test-time fakes.
+
+---
+
+## Configuration
+
+Configuration defaults live in `akita_vmail/utils.py` as `DEFAULT_CONFIG`. A
+local `config.json` (in repository root) will be merged recursively over the
+defaults when present. Use `get_config()` to access the cached config at
+runtime; call `load_config()` to force a reload.
+
+Key config sections:
+- `meshtastic_port_num`: default app port number used when sending data
+- `chunking`: sizes, default key, retry_count, retry delays and timeouts
+- `audio`: default quality keys and sampling rates, default recording length
+
+---
+
+## Running Tests
+
+Unit tests use Python's `unittest`. To run tests locally:
+
+```bash
+python -m unittest discover -v
+```
+
+The test harness includes fakes/mocks for runtime-only modules so tests run
+headlessly (no audio hardware or Meshtastic device required).
+
+---
+
+## Project layout
+
+- `akita_vmail/` - application package
+	- `main.py` - application entrypoint
+	- `gui.py` - main Tkinter app (componentized)
+	- `audio_handler.py` - audio recording/playback/compression
+	- `meshtastic_handler.py` - Meshtastic interface and send/receive logic
+	- `protocol.py` - message formats, CRC, chunk helpers (config-aware)
+	- `utils.py` - config loader, logging helpers, small GUI utilities
+	- `style_helper.py` and `_panel.py` files - UI components
+- `voice_messages/` - runtime recordings and received messages (created at runtime)
+- `requirements.txt` - Python dependencies
+- `tests/` - unit tests
 
 ---
 
 ## Troubleshooting
 
-- If imports fail for `pyaudio` or `meshtastic`, ensure the packages are installed in the active environment. For `pyaudio` on Windows, prefer `pipwin` as shown above.
-- If the Meshtastic device isn't detected, verify the COM port in Device Manager (Windows) or use `ls /dev/tty*` on Unix. The GUI accepts COM names (e.g., `COM3`) or IP addresses for TCP connections.
-- Logs appear in the GUI log pane; enable console logging by running without a frozen/bundled executable.
+- If `meshtastic` or `pyaudio` imports fail, confirm they are installed in
+	the active virtual environment.
+- If the Meshtastic device is not found by serial, ensure the COM port is
+	correct and accessible by the running user.
+- The GUI intentionally uses explicit imports for components; a missing
+	component file will produce an import error at startup so the problem is
+	visible immediately.
 
 ---
 
-## Development Notes
+## Development notes
 
-- The GUI lives in `akita_vmail/gui.py`.
-- Audio logic is in `akita_vmail/audio_handler.py` and protocol helpers are in `akita_vmail/protocol.py`.
-- If you modify config loading, see `akita_vmail/utils.py` for the `load_config()` helper.
+- Use the `config` argument when creating handlers in code to ensure
+	configuration is explicit (e.g., `AudioHandler(self.log, config)`).
+- Prefer the protocol getters (e.g., `get_chunk_sizes(config)`) to avoid
+	relying on import-time constants.
+
+---
+
+## License & Contact
+
+This project is published by Akita Engineering. See the `LICENSE` file in
+the repository root for licensing details. For questions contact
+info@akitaengineering.com.
+Run from the project root with the venv Python (or after activating the venv):
 
 
 
+```powershell
+
+python akita_vmail/main.py
 

@@ -1,6 +1,694 @@
 # -*- coding: utf-8 -*-
 """
 File: gui.py
+Description: Main Tkinter GUI application class (AkitaVmailApp)
+             for the Meshtastic Voice Messenger. Uses decomposed
+             component panels and explicit imports (fail-fast).
+"""
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox, Listbox, Scrollbar, Frame
+import queue
+import threading
+import time
+import logging
+import os
+from datetime import datetime
+
+# Local utilities and components (explicit imports)
+from .utils import log_to_gui, add_tooltip, setup_logging_queue, clear_scrolled_text
+from .protocol import (
+    MSG_TYPE_VOICE_CHUNK, MSG_TYPE_ACK, MSG_TYPE_TEST, MSG_TYPE_COMPLETE_VOICE,
+    verify_chunk_crc, verify_complete_voice_crc, get_chunk_sizes, get_default_chunk_size_key, get_chunk_timeout
+)
+from .audio_handler import AudioHandler
+from .meshtastic_handler import MeshtasticHandler
+from .style_helper import setup_styles
+from .header_panel import HeaderPanel
+from .connection_panel import ConnectionPanel
+from .recording_panel import RecordingPanel
+from .controls_panel import ControlsPanel
+from .messages_panel import MessagesPanel
+from .log_panel import LogPanel
+from .status_panel import StatusPanel
+
+
+class AkitaVmailApp:
+    """Main application class for Akita vMail."""
+
+    def __init__(self, master, config: dict | None = None):
+        self.master = master
+        self.config = config or {}
+
+        # State
+        self.is_connected = False
+        self.message_chunks: dict = {}
+        self.voice_messages: list = []
+        self.current_recording_path: str | None = None
+        self.com_ports: list = []
+
+        # Logging queue and wiring
+        self.log_queue = queue.Queue()
+        setup_logging_queue(self.log_queue)
+
+        # Create handlers (pass config and logging infrastructure)
+        # MeshtasticHandler expects a log_queue and a receive_callback
+        try:
+            self.meshtastic_handler = MeshtasticHandler(self.log_queue, self.handle_received_message, self.config)
+        except Exception:
+            # If Meshtastic can't be created here, create a minimal stub to avoid crashes during GUI init
+            self.meshtastic_handler = type('Stub', (), {'is_connected': False, 'sending_active': False, 'get_available_ports': lambda *_: []})()
+
+        self.audio_handler = AudioHandler(self.log, self.config)
+
+        # Apply styles (expects the app instance)
+        try:
+            setup_styles(self)
+        except Exception:
+            pass
+
+        # Build UI
+        self.create_widgets()
+
+        # Start background log listener
+        self._log_listener_thread = threading.Thread(target=self._log_listener, daemon=True)
+        self._log_listener_thread.start()
+
+        # Periodic chunk cleanup
+        self.master.after(1000, self.check_incomplete_chunks)
+
+        # Window close handler
+        try:
+            self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
+        except Exception:
+            pass
+
+    # --- Logging and helper ---
+    def _log_listener(self):
+        fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        while True:
+            try:
+                record = self.log_queue.get(timeout=0.5)
+            except queue.Empty:
+                # Stop if master is gone
+                try:
+                    if not self.master or not self.master.winfo_exists():
+                        break
+                except Exception:
+                    break
+                continue
+            if record is None:
+                break
+            try:
+                text = fmt.format(record)
+                # Safely schedule GUI log update
+                try:
+                    if self.master and self.master.winfo_exists():
+                        self.master.after(0, log_to_gui, getattr(self, 'log_display', None), text)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    def log(self, message: str, level=logging.INFO):
+        logging.log(level, message)
+        # Also show in GUI log if available
+        try:
+            if hasattr(self, 'log_display') and self.master and self.master.winfo_exists():
+                self.master.after(0, log_to_gui, self.log_display, f"{logging.getLevelName(level)}: {message}")
+        except Exception:
+            pass
+
+    # --- UI Construction ---
+    def create_widgets(self):
+        """Create and place GUI components using decomposed panels."""
+        main_frame = ttk.Frame(self.master, padding="15")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Header
+        HeaderPanel(main_frame, self)
+
+        # Top row: connection + recording
+        top_row_frame = ttk.Frame(main_frame)
+        top_row_frame.pack(fill=tk.X, pady=5)
+        ConnectionPanel(top_row_frame, self)
+        RecordingPanel(top_row_frame, self)
+
+        # Controls, messages, log, status
+        ControlsPanel(main_frame, self)
+        MessagesPanel(main_frame, self)
+        LogPanel(main_frame, self)
+        StatusPanel(self.master, self)
+
+    # --- UI update methods (existing logic preserved) ---
+    def update_status(self, message: str):
+        if self.master and self.master.winfo_exists():
+            try:
+                if not hasattr(self, 'status_var'):
+                    self.status_var = tk.StringVar(value=f"Status: {message}")
+                else:
+                    self.status_var.set(f"Status: {message}")
+            except Exception:
+                pass
+
+    def update_ui_state(self):
+        if not self.master or not self.master.winfo_exists() or not hasattr(self, 'connect_button'):
+            return
+        try:
+            is_rec = getattr(self.audio_handler, 'recording', False)
+            is_play = getattr(self.audio_handler, 'playing', False)
+            has_recording = self.current_recording_path and os.path.isfile(self.current_recording_path)
+            is_sending = getattr(self.meshtastic_handler, 'sending_active', False)
+
+            selection = getattr(self, 'messages_list', None).curselection() if hasattr(self, 'messages_list') else ()
+            has_selection = bool(selection)
+            can_play_selection = False
+            if has_selection:
+                idx = selection[0]
+                if 0 <= idx < len(self.voice_messages):
+                    can_play_selection = bool(self.voice_messages[idx].get("filepath"))
+
+            connect_state = tk.NORMAL if not self.is_connected else tk.DISABLED
+            self.connect_target_entry.config(state=connect_state)
+            self.connect_button.config(text="Disconnect" if self.is_connected else "Connect", state=tk.NORMAL)
+
+            test_btn_state = tk.NORMAL if self.is_connected and not is_sending else tk.DISABLED
+            self.test_button.config(state=test_btn_state)
+
+            if is_rec:
+                self.record_button.config(text="⏹ Stop Rec", state=tk.NORMAL)
+            else:
+                rec_btn_state = tk.NORMAL if self.is_connected and not is_play and not is_sending else tk.DISABLED
+                self.record_button.config(text="🎤 Record", state=rec_btn_state)
+
+            send_btn_state = tk.NORMAL if self.is_connected and has_recording and not is_rec and not is_play and not is_sending else tk.DISABLED
+            self.send_button.config(state=send_btn_state)
+
+            play_btn_state = tk.NORMAL if can_play_selection and not is_rec and not is_play and not is_sending else tk.DISABLED
+            self.play_button.config(state=play_btn_state)
+
+            stop_btn_state = tk.NORMAL if is_play else tk.DISABLED
+            self.stop_button.config(state=stop_btn_state)
+
+        except Exception as e:
+            self.log(f"Error updating UI state: {e}", logging.ERROR)
+
+    def refresh_ports(self):
+        self.log("Refreshing COM ports list...")
+        try:
+            self.com_ports = self.meshtastic_handler.get_available_ports()
+            current_target = self.connect_target_var.get() if hasattr(self, 'connect_target_var') else ''
+            if not current_target or any(s in current_target.upper() for s in ["COM", "/DEV/TTY", "/DEV/CU."]):
+                if self.com_ports:
+                    self.connect_target_var.set(self.com_ports[0])
+                else:
+                    self.connect_target_var.set("")
+            self.log("COM ports list refreshed.")
+        except Exception as e:
+            self.log(f"Error refreshing ports: {e}", logging.ERROR)
+
+    def update_chunk_size(self, event=None):
+        selected_key = getattr(self, 'chunk_size_var', tk.StringVar(value='')) and self.chunk_size_var.get()
+        try:
+            sizes = get_chunk_sizes(self.config)
+            if selected_key in sizes:
+                new_size = sizes[selected_key]
+                if new_size != getattr(self, 'max_chunk_size', None):
+                    self.max_chunk_size = new_size
+                    self.log(f"Max network payload size set to {selected_key} ({self.max_chunk_size} bytes)")
+                return
+            default_key = get_default_chunk_size_key(self.config)
+            self.chunk_size_var.set(default_key)
+            self.max_chunk_size = sizes.get(default_key, getattr(self, 'max_chunk_size', 180))
+        except Exception:
+            self.log(f"Invalid chunk size key: {selected_key}. Using default.", logging.WARNING)
+
+    # --- Connection and Recording controls ---
+    def toggle_connection(self):
+        if self.is_connected:
+            self.update_status("Disconnecting...")
+            try:
+                self.meshtastic_handler.disconnect()
+            except Exception:
+                pass
+        else:
+            target = self.connect_target_var.get().strip()
+            if not target:
+                messagebox.showerror("Error", "Please enter a COM Port or IP Address.")
+                return
+            self.update_status(f"Connecting to {target}...")
+            self.connect_button.config(state=tk.DISABLED)
+            try:
+                self.meshtastic_handler.connect(target)
+            except Exception as e:
+                self.log(f"Connection attempt failed: {e}", logging.ERROR)
+
+    def toggle_recording(self):
+        if getattr(self.audio_handler, 'recording', False):
+            self.update_status("Stopping recording...")
+            self.record_button.config(state=tk.DISABLED)
+            if self.current_recording_path:
+                threading.Thread(target=self._stop_recording_thread, args=(self.current_recording_path,), daemon=True).start()
+            else:
+                self.log("Error: No recording path available.", logging.ERROR)
+                self.audio_handler.stop_recording("dummy_error.wav")
+                self.update_status("Recording stopped (Error - No Path)")
+                self.update_ui_state()
+        else:
+            if not self.is_connected:
+                messagebox.showwarning("Not Connected", "Connect before recording.")
+                return
+            quality = self.compression_quality_var.get()
+            seconds_str = self.recording_length_var.get()
+            clamped_seconds = self.audio_handler.set_recording_params(seconds_str, quality)
+            if str(clamped_seconds) != seconds_str:
+                self.recording_length_var.set(str(clamped_seconds))
+
+            self.update_status(f"Starting recording ({clamped_seconds}s)...")
+            self.record_button.config(state=tk.DISABLED)
+            success, filepath = self.audio_handler.start_recording()
+            if success:
+                self.current_recording_path = filepath
+                self.log(f"Recording started. Output file: {filepath}")
+                self.update_status("Recording...")
+                self.master.after(int(clamped_seconds * 1000) + 100, self.auto_stop_recording)
+            else:
+                self.log("Failed to start recording.", logging.ERROR)
+                self.update_status("Recording failed to start")
+                self.current_recording_path = None
+                messagebox.showerror("Recording Error", "Could not start recording.")
+            self.update_ui_state()
+
+    def _stop_recording_thread(self, filepath: str):
+        success = self.audio_handler.stop_recording(filepath)
+        self.master.after(0, self._stop_recording_finished, success, filepath)
+
+    def _stop_recording_finished(self, success: bool, filepath: str):
+        if success:
+            self.log(f"Recording finished and saved: {filepath}")
+            desc = f"🎙️ My Recording @ {datetime.now().strftime('%H:%M:%S')}"
+            self.add_message_to_list(desc, filepath, "Me")
+            self.update_status("Recording saved")
+        else:
+            self.log("Recording stopped, but failed to save.", logging.WARNING)
+            self.current_recording_path = None
+            self.update_status("Recording stopped (Save failed)")
+            messagebox.showwarning("Save Error", f"Could not save recording to:\n{filepath}")
+        self.update_ui_state()
+
+    def auto_stop_recording(self):
+        if getattr(self.audio_handler, 'recording', False):
+            self.log("Recording duration reached. Stopping automatically.")
+            self.toggle_recording()
+
+    def add_message_to_list(self, description: str, filepath: str | None, from_id: str):
+        icon = "❓"
+        if filepath and from_id == "Me":
+            icon = "🎙️"
+        elif filepath:
+            icon = "🔊"
+        elif not filepath:
+            icon = "💬"
+        full_description = f"{icon} {description}"
+        self.voice_messages.append({"description": full_description, "filepath": filepath, "from_id": from_id})
+        if hasattr(self, 'messages_list'):
+            self.messages_list.insert(tk.END, full_description)
+            self.messages_list.yview(tk.END)
+
+    def on_message_select(self, event=None):
+        self.update_ui_state()
+
+    def play_selected_message(self):
+        selection = self.messages_list.curselection()
+        if not selection:
+            return
+        index = selection[0]
+        if 0 <= index < len(self.voice_messages):
+            message_info = self.voice_messages[index]
+            filepath = message_info.get("filepath")
+            description = message_info.get("description")
+            if filepath and os.path.isfile(filepath):
+                self.update_status(f"Playing: {description}")
+                self.update_ui_state()
+                threading.Thread(target=self._play_thread, args=(filepath,), daemon=True).start()
+            elif filepath:
+                self.log(f"Audio file not found: {filepath}", logging.ERROR)
+                messagebox.showerror("Playback Error", f"Audio file not found:\n{filepath}")
+                self.update_status("Playback Error (File Not Found)")
+            else:
+                self.log("Selected item is not playable.", logging.INFO)
+                self.update_status("Cannot play selected item")
+        else:
+            self.log(f"Invalid selection index: {index}", logging.WARNING)
+
+    def _play_thread(self, filepath: str):
+        success = self.audio_handler.start_playback(filepath)
+        if success:
+            while getattr(self.audio_handler, 'playing', False):
+                time.sleep(0.1)
+        self.master.after(0, self._playback_finished)
+
+    def _playback_finished(self):
+        try:
+            self.audio_handler.playback_finished()
+        except Exception:
+            pass
+        self.update_status("Playback finished")
+        self.update_ui_state()
+
+    def stop_playback(self):
+        if getattr(self.audio_handler, 'playing', False):
+            self.log("Stop playback requested.")
+            self.audio_handler.stop_playback()
+            self.update_status("Playback stopped")
+            self.update_ui_state()
+
+    def send_test_message(self):
+        if not self.is_connected:
+            messagebox.showerror("Error", "Not connected.")
+            return
+        if getattr(self.meshtastic_handler, 'sending_active', False):
+            messagebox.showwarning("Busy", "Already sending.")
+            return
+        self.update_status("Sending test message...")
+        node_name = "N/A"
+        try:
+            if getattr(self.meshtastic_handler, 'interface', None) and getattr(self.meshtastic_handler.interface, 'myInfo', None):
+                node_name = self.meshtastic_handler.interface.myInfo.long_name or f"!{self.meshtastic_handler.interface.myInfo.my_node_num:x}"
+        except Exception:
+            pass
+        message = f"Akita vMail test from {node_name} @ {datetime.now().strftime('%H:%M:%S')}"
+        self.update_ui_state()
+        threading.Thread(target=self._send_test_thread, args=(message,), daemon=True).start()
+
+    def _send_test_thread(self, message: str):
+        success = False
+        try:
+            success = self.meshtastic_handler.send_test_message(message)
+        except Exception:
+            self.log("Failed to send test message.", logging.ERROR)
+        self.master.after(0, self._send_finished, success, "Test message")
+
+    def send_voice_message(self):
+        if not self.is_connected:
+            messagebox.showerror("Error", "Not connected.")
+            return
+        if not self.current_recording_path or not os.path.isfile(self.current_recording_path):
+            messagebox.showerror("Error", "No valid recording available.")
+            return
+        if getattr(self.meshtastic_handler, 'sending_active', False):
+            messagebox.showwarning("Busy", "Already sending.")
+            return
+
+        self.update_chunk_size()
+        quality = self.compression_quality_var.get()
+        filepath = self.current_recording_path
+        filename_short = os.path.basename(filepath)
+        self.update_status(f"Preparing '{filename_short}'...")
+        self.log(f"Initiating send: {filepath}, Quality: {quality}, ChunkKey: {getattr(self, 'chunk_size_var', None) and self.chunk_size_var.get()} ({getattr(self, 'max_chunk_size', 'unknown')} bytes)")
+        self.update_ui_state()
+        threading.Thread(target=self._send_voice_thread, args=(filepath, quality), daemon=True).start()
+
+    def _send_voice_thread(self, filepath: str, quality: str):
+        filename_short = os.path.basename(filepath)
+        self.master.after(0, self.update_status, f"Compressing '{filename_short}' ({quality})...")
+        compressed_data = self.audio_handler.compress_audio(filepath, quality)
+
+        if not compressed_data:
+            self.master.after(0, messagebox.showerror, "Compression Error", f"Failed to compress:\n{filename_short}")
+            self.master.after(0, self.update_status, "Compression Failed")
+            self.master.after(0, self.update_ui_state)
+            return
+
+        data_len = len(compressed_data)
+        estimated_payload_len = data_len * 1.34 + 150
+        success = False
+        description = f"Voice message '{filename_short}' ({data_len} bytes compressed)"
+
+        if estimated_payload_len > getattr(self, 'max_chunk_size', 180):
+            self.master.after(0, self.update_status, f"Sending chunked: {filename_short} ({data_len} bytes)...")
+            try:
+                success = self.meshtastic_handler.send_chunked_message(compressed_data, self.max_chunk_size)
+            except Exception:
+                success = False
+        else:
+            self.master.after(0, self.update_status, f"Sending complete: {filename_short} ({data_len} bytes)...")
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            try:
+                success = self.meshtastic_handler.send_complete_voice_message(compressed_data, timestamp)
+            except Exception:
+                success = False
+
+        self.master.after(0, self._send_finished, success, description)
+
+    def _send_finished(self, success: bool, description: str):
+        if success:
+            self.log(f"Send command for '{description}' issued successfully.")
+            self.update_status("Send Successful")
+        else:
+            self.log(f"Failed to send '{description}'.", logging.ERROR)
+            self.update_status("Send Failed")
+            messagebox.showerror("Send Error", f"Failed to send {description}.\nCheck connection and logs.")
+        self.update_ui_state()
+
+    # --- Receiving and chunk handling ---
+    def handle_received_message(self, msg_type: str, data: any, from_id: str, packet_id: str):
+        try:
+            self.master.after(0, self._process_received_message_mainthread, msg_type, data, from_id, packet_id)
+        except Exception:
+            pass
+
+    def _process_received_message_mainthread(self, msg_type: str, data: any, from_id: str, packet_id: str):
+        self.log(f"GUI Thread: Processing {msg_type} from {from_id} (PktID: {packet_id})", logging.DEBUG)
+
+        if msg_type == 'status':
+            full_status = str(data)
+            if "Connected: Node:" in full_status:
+                self.connected_node_info = full_status.split("Connected: ", 1)[1]
+                status_display = f"Connected: {self.connected_node_info}"
+            elif "Disconnected" in full_status or "Failed" in full_status:
+                self.connected_node_info = "N/A"
+                status_display = full_status
+            else:
+                status_display = full_status
+            self.update_status(status_display)
+            self.is_connected = "Connected" in status_display and "Failed" not in status_display
+            self.update_ui_state()
+            return
+
+        elif msg_type == 'text':
+            desc = f"from {from_id}: {data}"
+            self.add_message_to_list(desc, None, from_id)
+            self.update_status(f"Received Text from {from_id}")
+
+        elif msg_type == 'data':
+            if not isinstance(data, dict):
+                self.log(f"Received non-dict data payload from {from_id}. Ignoring.", logging.WARNING)
+                return
+            payload_type = data.get('type')
+            if payload_type == MSG_TYPE_TEST:
+                test_msg = data.get('test', '(empty)')
+                self.log(f"Received Test from {from_id}: {test_msg}")
+                messagebox.showinfo("Test Received", f"From: {from_id}\nMessage: {test_msg}")
+                self.update_status(f"Received Test from {from_id}")
+
+            elif payload_type == MSG_TYPE_COMPLETE_VOICE:
+                self.log(f"Processing Complete Voice from {from_id}")
+                crc_ok, raw_voice_data = verify_complete_voice_crc(data)
+                if crc_ok and raw_voice_data:
+                    timestamp = data.get('timestamp', datetime.now().strftime('%Y%m%d_%H%M%S'))
+                    filename = os.path.join(self.audio_handler.voice_message_dir, f"rec_{from_id}_{timestamp}.wav")
+                    if self.audio_handler.create_wav_from_compressed(raw_voice_data, filename):
+                        desc = f"from {from_id} @ {timestamp}"
+                        self.add_message_to_list(desc, filename, from_id)
+                        self.update_status(f"Received Voice from {from_id}")
+                    else:
+                        self.update_status(f"Voice decode error from {from_id}")
+                else:
+                    self.log(f"CRC check failed for complete voice from {from_id}", logging.WARNING)
+                    self.update_status(f"Voice CRC error from {from_id}")
+
+            elif payload_type == MSG_TYPE_VOICE_CHUNK:
+                self.process_incoming_chunk(data, from_id)
+
+            elif payload_type == MSG_TYPE_ACK:
+                ack_id = data.get('ack_id')
+                chunk_num = data.get('chunk_num')
+                self.log(f"Received ACK for chunk {chunk_num} (ID: {ack_id}) from {from_id}", logging.INFO)
+            else:
+                self.log(f"Received unknown data type '{payload_type}' from {from_id}.", logging.WARNING)
+        else:
+            self.log(f"Received unhandled message type '{msg_type}' from {from_id}", logging.WARNING)
+
+    def process_incoming_chunk(self, chunk_data: dict, from_node: str):
+        chunk_id = chunk_data.get('chunk_id')
+        chunk_num = chunk_data.get('chunk_num')
+        total_chunks = chunk_data.get('total_chunks')
+        if not all([chunk_id, isinstance(chunk_num, int), isinstance(total_chunks, int)]):
+            self.log(f"Invalid chunk data from {from_node}: {chunk_data}", logging.WARNING)
+            return
+
+        self.log(f"Processing chunk {chunk_num}/{total_chunks} (ID: {chunk_id}) from {from_node}", logging.DEBUG)
+        crc_ok, raw_chunk_data = verify_chunk_crc(chunk_data)
+        if not crc_ok:
+            self.update_status(f"Chunk CRC error from {from_node} (ID:{chunk_id} Num:{chunk_num})")
+            return
+
+        # Send ACK
+        try:
+            self.meshtastic_handler.send_ack(chunk_id, chunk_num, from_node)
+        except Exception:
+            pass
+
+        if chunk_id not in self.message_chunks:
+            if chunk_num == 1:
+                self.message_chunks[chunk_id] = {'chunks': {}, 'total': total_chunks, 'from_id': from_node, 'timestamp': time.time()}
+                self.log(f"Started receiving message {chunk_id} ({total_chunks} chunks) from {from_node}")
+                self.update_status(f"Receiving {chunk_id} from {from_node} (1/{total_chunks})...")
+            else:
+                self.log(f"Received chunk {chunk_num} for {chunk_id} before chunk 1. Discarding.", logging.WARNING)
+                return
+
+        if chunk_id in self.message_chunks:
+            if chunk_num not in self.message_chunks[chunk_id]['chunks']:
+                self.message_chunks[chunk_id]['chunks'][chunk_num] = raw_chunk_data
+                self.message_chunks[chunk_id]['timestamp'] = time.time()
+                self.log(f"Stored chunk {chunk_num} for {chunk_id}.", logging.DEBUG)
+            else:
+                self.log(f"Duplicate chunk {chunk_num} for {chunk_id}. Ignoring.", logging.DEBUG)
+                return
+
+            received_count = len(self.message_chunks[chunk_id]['chunks'])
+            total_expected = self.message_chunks[chunk_id]['total']
+            self.update_status(f"Receiving {chunk_id} ({received_count}/{total_expected})...")
+            self.log(f"Have {received_count}/{total_expected} chunks for {chunk_id}.", logging.DEBUG)
+
+            if received_count >= total_expected:
+                if received_count > total_expected:
+                    self.log(f"Warning: Received more chunks ({received_count}) than expected ({total_expected}) for {chunk_id}.", logging.WARNING)
+                self.log(f"Received all expected chunks for {chunk_id}. Reassembling...")
+                self.reassemble_message(chunk_id)
+        else:
+            self.log(f"Received chunk {chunk_num} for untracked message ID {chunk_id}.", logging.WARNING)
+
+    def reassemble_message(self, chunk_id: str):
+        if chunk_id not in self.message_chunks:
+            self.log(f"Cannot reassemble: ID {chunk_id} not found.", logging.ERROR)
+            return
+        message_info = self.message_chunks[chunk_id]
+        from_node = message_info['from_id']
+        total_chunks = message_info['total']
+        received_chunks_map = message_info['chunks']
+        received_count = len(received_chunks_map)
+
+        if received_count < total_chunks:
+            self.log(f"Reassembly called for {chunk_id} but missing chunks ({received_count}/{total_chunks}). Aborting.", logging.WARNING)
+            return
+
+        combined_data = b""
+        missing_chunk_numbers = []
+        reassembly_successful = True
+        try:
+            for i in range(1, total_chunks + 1):
+                if i in received_chunks_map:
+                    combined_data += received_chunks_map[i]
+                else:
+                    missing_chunk_numbers.append(i)
+                    reassembly_successful = False
+
+            if not reassembly_successful:
+                self.log(f"Reassembly failed for {chunk_id}: Missing data for chunks: {missing_chunk_numbers}", logging.ERROR)
+                self.update_status(f"Reassembly failed for {chunk_id}")
+            else:
+                self.log(f"Combined {total_chunks} chunks for {chunk_id}. Size: {len(combined_data)} bytes.")
+                timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+                filename = os.path.join(self.audio_handler.voice_message_dir, f"rec_{from_node}_{timestamp_str}_chunked.wav")
+                if self.audio_handler.create_wav_from_compressed(combined_data, filename):
+                    desc = f"from {from_node} @ {timestamp_str} (Chunked)"
+                    self.add_message_to_list(desc, filename, from_node)
+                    self.update_status(f"Reassembled Voice from {from_node}")
+                    self.log(f"Reassembled and saved {chunk_id} to {filename}")
+                else:
+                    self.update_status(f"Reassembly decode error from {from_node}")
+                    reassembly_successful = False
+        except Exception as e:
+            self.log(f"Unexpected error reassembling {chunk_id}: {e}", logging.ERROR)
+            import traceback; self.log(traceback.format_exc(), logging.ERROR)
+            reassembly_successful = False
+            self.update_status(f"Reassembly error for {chunk_id}")
+        finally:
+            if chunk_id in self.message_chunks:
+                del self.message_chunks[chunk_id]
+                self.log(f"Cleaned up chunk data for {chunk_id}.", logging.DEBUG)
+
+    def check_incomplete_chunks(self):
+        now = time.time()
+        timed_out_ids = []
+        chunk_timeout = get_chunk_timeout(self.config)
+        for chunk_id in list(self.message_chunks.keys()):
+            message_info = self.message_chunks.get(chunk_id)
+            if not message_info:
+                continue
+            last_update = message_info.get('timestamp', 0)
+            if now - last_update > chunk_timeout:
+                timed_out_ids.append(chunk_id)
+                rcvd = len(message_info['chunks']); total = message_info['total']
+                frm = message_info['from_id']
+                self.log(f"Message {chunk_id} from {frm} timed out ({rcvd}/{total} chunks). Discarding.", logging.WARNING)
+
+        if timed_out_ids:
+            self.log(f"Cleaning up timed-out messages: {timed_out_ids}", logging.INFO)
+            for chunk_id in timed_out_ids:
+                if chunk_id in self.message_chunks:
+                    del self.message_chunks[chunk_id]
+            self.update_status("Cleaned up timed-out messages")
+
+        try:
+            self.master.after(int(chunk_timeout * 1000 / 2), self.check_incomplete_chunks)
+        except Exception:
+            pass
+
+    def clear_log_display(self):
+        clear_scrolled_text(getattr(self, 'log_display', None))
+
+    # --- Shutdown ---
+    def on_closing(self):
+        self.log("Closing application requested...")
+        self.update_status("Closing...")
+        try:
+            self.master.protocol("WM_DELETE_WINDOW", lambda: None)
+        except Exception:
+            pass
+        if getattr(self.meshtastic_handler, 'is_connected', False):
+            self.log("Disconnecting Meshtastic...")
+            try:
+                self.meshtastic_handler.disconnect()
+            except Exception as e:
+                self.log(f"Error initiating disconnect: {e}", logging.WARNING)
+            self.master.after(100, self._finish_close_after_disconnect, 0)
+        else:
+            self._finish_close()
+
+    def _finish_close_after_disconnect(self, elapsed_ms: int):
+        if not getattr(self.meshtastic_handler, 'is_connected', False) or elapsed_ms >= 2000:
+            self._finish_close()
+        else:
+            self.master.after(100, self._finish_close_after_disconnect, elapsed_ms + 100)
+
+    def _finish_close(self):
+        try:
+            self.log("Cleaning up audio resources...")
+            self.audio_handler.cleanup()
+        except Exception as e:
+            self.log(f"Error during audio cleanup: {e}", logging.WARNING)
+        try:
+            if self.master and self.master.winfo_exists():
+                self.master.destroy()
+        except Exception:
+            pass
+        self.log("Akita vMail closed.")
+# -*- coding: utf-8 -*-
+"""
+File: gui.py
 Description: Defines the main Tkinter GUI application class (AkitaVmailApp)
              for the Meshtastic Voice Messenger. Handles user interaction,
              displays messages and logs, and coordinates the audio and
@@ -18,252 +706,111 @@ import uuid # For unique recording filenames
 from datetime import datetime
 
 # --- Import local modules ---
-try:
-    # Utils now loads config first
-    from utils import log_to_gui, add_tooltip, setup_logging_queue, clear_scrolled_text, load_config, get_config
-    # Protocol exposes message types and runtime getters
-    from protocol import (
-        MSG_TYPE_VOICE_CHUNK, MSG_TYPE_ACK,
-        MSG_TYPE_TEST, MSG_TYPE_COMPLETE_VOICE, verify_chunk_crc,
-        verify_complete_voice_crc, get_chunk_sizes, get_default_chunk_size_key, get_default_chunk_size, get_chunk_timeout
-    )
-    # Audio handler also loads config for its defaults
-    from audio_handler import AudioHandler
-    from meshtastic_handler import MeshtasticHandler
-except ImportError as e:
-     print(f"FATAL ERROR: Could not import required local modules: {e}")
-     print("Ensure utils.py, audio_handler.py, meshtastic_handler.py, and protocol.py are present.")
-     exit(1)
+from .utils import log_to_gui, add_tooltip, setup_logging_queue, clear_scrolled_text
+from .protocol import (
+    MSG_TYPE_VOICE_CHUNK, MSG_TYPE_ACK,
+    MSG_TYPE_TEST, MSG_TYPE_COMPLETE_VOICE, verify_chunk_crc,
+    verify_complete_voice_crc, get_chunk_sizes, get_default_chunk_size_key, get_default_chunk_size, get_chunk_timeout
+)
+from .audio_handler import AudioHandler
+from .meshtastic_handler import MeshtasticHandler
 
+# Centralized style and GUI components (explicit imports — fail fast if missing)
+from .style_helper import setup_styles
+from .header_panel import HeaderPanel
+from .connection_panel import ConnectionPanel
+from .recording_panel import RecordingPanel
+from .controls_panel import ControlsPanel
+from .messages_panel import MessagesPanel
+        # --- Main Container Frame ---
+        main_frame = ttk.Frame(self.master, padding="15")
+        main_frame.pack(fill=tk.BOTH, expand=True)
 
-class AkitaVmailApp:
-    """Main application class for the Akita vMail GUI."""
+        # --- Header ---
+        HeaderPanel(main_frame, self)
 
-    def __init__(self, master: tk.Tk, config: dict | None = None):
-        """Initialize the application."""
-        self.master = master
-        master.title("Akita vMail - Meshtastic Voice Messenger")
-        master.geometry("750x750")
-        master.minsize(650, 650)
+        # --- Top Row: Connection & Recording Settings ---
+        top_row_frame = ttk.Frame(main_frame)
+        top_row_frame.pack(fill=tk.X, pady=5)
 
-        # --- Load Config ---
-        # Prefer the config passed in from `main`; fallback to utils cached config
-        if config is None:
-            try:
-                from utils import get_config, load_config
-                try:
-                    self.config = get_config()
-                except Exception:
-                    self.config = load_config()
-            except Exception:
-                self.config = {}
-        else:
-            self.config = config
+        # Connection and Recording panels
+        ConnectionPanel(top_row_frame, self)
+        RecordingPanel(top_row_frame, self)
 
-        # Protocol getters will be called with `self.config` where needed.
+        # --- Middle Row: Voice Controls ---
+        ControlsPanel(main_frame, self)
 
-        audio_cfg = self.config.get("audio", {})
-        chunk_cfg = self.config.get("chunking", {})
+        # --- Messages List ---
+        MessagesPanel(main_frame, self)
 
-        # --- Internal State ---
-        self.is_connected = False
-        self.current_recording_path = None
-        self.voice_messages = [] # List of dicts: {"description", "filepath", "from_id"}
-        self.message_chunks = {} # Dict for reassembly: {chunk_id: {chunks, total, from_id, timestamp}}
-        # Get chunk size default from protocol getter
-        try:
-            from protocol import get_default_chunk_size
-            self.max_chunk_size = get_default_chunk_size(self.config)
-        except Exception:
-            self.max_chunk_size = 180
-        self.log_queue = queue.Queue()
-        self.connected_node_info = "N/A" # Store connected node info string
+        # --- Log Display ---
+        LogPanel(main_frame, self)
 
-        # --- Setup Logging ---
-        self.log_display = None
-        setup_logging_queue(self.log_queue)
-        self.master.after(100, self.process_log_queue)
-
-        # --- Initialize Handlers ---
-        # Pass central config into handlers to avoid multiple independent loads
-        self.audio_handler = AudioHandler(self.log, config=self.config)
-        self.meshtastic_handler = MeshtasticHandler(self.log_queue, self.handle_received_message, config=self.config)
-
-        # --- UI Styling ---
-        self._setup_styles()
-
-        # --- Create Widgets ---
-        self.create_widgets()
-
-        # --- Periodic Tasks ---
-        try:
-            from protocol import get_chunk_timeout
-            timeout = get_chunk_timeout()
-        except Exception:
-            timeout = chunk_cfg.get("receive_timeout_sec", 60)
-        chunk_timeout_ms = int(timeout * 1000)
-        self.master.after(chunk_timeout_ms, self.check_incomplete_chunks)
-
-        # --- Cleanup on Close ---
-        self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
-
-        self.log("Akita vMail application initialized.")
-        self.update_ui_state()
-
-
-    def _setup_styles(self):
-        """Configure ttk styles for the application."""
-        self.bg_color = "#F0F4F8"
-        self.accent_color = "#2980B9"
-        self.button_color = "#3498DB"
-        self.text_color = "#2C3E50"
-        self.list_bg = "#ECF0F1"
-        self.log_bg = "#FFFFFF"
-        self.status_bg = "#BDC3C7"
-        self.error_color = "#E74C3C"
-
-        self.master.configure(bg=self.bg_color)
-        self.style = ttk.Style()
-        try: self.style.theme_use('clam')
-        except tk.TclError: self.log("Clam theme not available, using default.", logging.WARNING)
-
-        self.style.configure("TFrame", background=self.bg_color)
-        self.style.configure("TLabel", background=self.bg_color, foreground=self.text_color, font=("Arial", 10))
-        self.style.configure("Header.TLabel", font=("Arial", 16, "bold"), foreground=self.accent_color)
-        self.style.configure("Status.TLabel", font=("Arial", 9), foreground=self.text_color, background=self.status_bg, padding=3)
-        self.style.configure("TButton", font=("Arial", 10, "bold"), foreground="white", background=self.button_color, borderwidth=1, padding=(5, 3))
-        self.style.map("TButton", background=[('active', self.accent_color), ('disabled', '#a0a0a0')], foreground=[('disabled', '#d0d0d0')])
-        self.style.configure("TLabelframe", background=self.bg_color, bordercolor=self.accent_color, relief=tk.GROOVE, padding=5)
-        self.style.configure("TLabelframe.Label", background=self.bg_color, foreground=self.accent_color, font=("Arial", 11, "bold"))
-        self.style.configure("TCombobox", font=("Arial", 10), padding=2)
-        self.style.configure("TEntry", font=("Arial", 10), padding=2)
-
-        # Listbox styling via option_add
-        self.master.option_add('*Listbox.background', self.list_bg)
-        self.master.option_add('*Listbox.foreground', self.text_color)
-        self.master.option_add('*Listbox.font', ('Arial', 10))
-        self.master.option_add('*Listbox.borderwidth', 0)
-        self.master.option_add('*Listbox.highlightThickness', 1)
-        self.master.option_add('*Listbox.highlightColor', self.accent_color)
-        self.master.option_add('*Listbox.selectBackground', self.accent_color)
-        self.master.option_add('*Listbox.selectForeground', 'white')
-
-        # ScrolledText styling via option_add
-        self.master.option_add('*ScrolledText.background', self.log_bg)
-        self.master.option_add('*ScrolledText.foreground', self.text_color)
-        self.master.option_add('*ScrolledText.font', ('Courier New', 9))
-        self.master.option_add('*ScrolledText.borderwidth', 0)
-        self.master.option_add('*ScrolledText.highlightThickness', 0)
-
-
-    def log(self, message: str, level=logging.INFO):
-        """Log message via the root logger (queued)."""
-        if level == logging.DEBUG: logging.debug(message)
-        elif level == logging.INFO: logging.info(message)
-        elif level == logging.WARNING: logging.warning(message)
-        elif level == logging.ERROR: logging.error(message)
-        elif level == logging.CRITICAL: logging.critical(message)
-        else: logging.log(level, message)
-
-    def process_log_queue(self):
-        """Process messages from the log queue and update the GUI log display."""
-        while not self.log_queue.empty():
-            try:
-                record = self.log_queue.get_nowait()
-                if self.log_display:
-                    log_to_gui(self.log_display, record.getMessage())
-            except queue.Empty:
-                break
-            except Exception as e:
-                print(f"Error processing log queue: {e}") # Fallback
-        self.master.after(100, self.process_log_queue)
-
-
-    def create_widgets(self):
+        # --- Status Bar (component) ---
+        StatusPanel(self.master, self)
         """Create all GUI elements and arrange them."""
         # --- Main Container Frame ---
         main_frame = ttk.Frame(self.master, padding="15")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         # --- Header ---
-        header_label = ttk.Label(main_frame, text="Akita vMail", style="Header.TLabel", anchor=tk.CENTER)
-        header_label.pack(fill=tk.X, pady=(0, 15))
+        try:
+            from header_panel import HeaderPanel
+            HeaderPanel(main_frame, self)
+        except Exception:
+            header_label = ttk.Label(main_frame, text="Akita vMail", style="Header.TLabel", anchor=tk.CENTER)
+            header_label.pack(fill=tk.X, pady=(0, 15))
 
         # --- Top Row: Connection & Recording Settings ---
         top_row_frame = ttk.Frame(main_frame)
         top_row_frame.pack(fill=tk.X, pady=5)
 
-        # --- Connection Settings Frame ---
-        settings_frame = ttk.LabelFrame(top_row_frame, text="Connection", padding="10")
-        settings_frame.pack(side=tk.LEFT, padx=(0, 10), fill=tk.Y, anchor='nw')
-        ttk.Label(settings_frame, text="Target:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-        target_frame = ttk.Frame(settings_frame)
-        target_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
-        self.com_ports = self.meshtastic_handler.get_available_ports()
-        self.connect_target_var = tk.StringVar()
-        self.connect_target_entry = ttk.Entry(target_frame, textvariable=self.connect_target_var, width=18)
-        if self.com_ports: self.connect_target_var.set(self.com_ports[0])
-        self.connect_target_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        add_tooltip(self.connect_target_entry, "Enter COM Port (e.g., COM3) or IP Address")
-        refresh_button = ttk.Button(target_frame, text="⟳", width=3, command=self.refresh_ports)
-        refresh_button.pack(side=tk.LEFT, padx=(5, 0))
-        add_tooltip(refresh_button, "Refresh COM Port List (updates dropdown if available)")
-        self.connect_button = ttk.Button(settings_frame, text="Connect", command=self.toggle_connection, width=10)
-        self.connect_button.grid(row=0, column=2, padx=(10, 5), pady=5)
-
-        # --- Recording Settings Frame ---
-        recording_frame = ttk.LabelFrame(top_row_frame, text="Recording", padding="10")
-        recording_frame.pack(side=tk.LEFT, padx=10, fill=tk.Y, anchor='nw')
-        # Use defaults from audio_handler which loaded config
-        audio_cfg = self.config.get("audio", {})
-        ttk.Label(recording_frame, text="Length (s):").grid(row=0, column=0, sticky=tk.W, padx=5, pady=3)
-        self.recording_length_var = tk.StringVar(value=str(self.audio_handler.record_seconds))
-        self.recording_length_entry = ttk.Entry(recording_frame, textvariable=self.recording_length_var, width=5)
-        self.recording_length_entry.grid(row=0, column=1, sticky=tk.W, padx=5, pady=3)
-        add_tooltip(self.recording_length_entry, "Recording duration (1-30 seconds)")
-        ttk.Label(recording_frame, text="Quality:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=3)
-        self.compression_quality_var = tk.StringVar(value=self.audio_handler.default_quality)
-        self.compression_quality_combo = ttk.Combobox(recording_frame, textvariable=self.compression_quality_var,
-                                                     values=list(self.audio_handler.quality_rates.keys()), width=10, state="readonly")
-        self.compression_quality_combo.grid(row=1, column=1, sticky=tk.W, padx=5, pady=3)
-        add_tooltip(self.compression_quality_combo, "Audio quality vs compressed size")
-        ttk.Label(recording_frame, text="Chunk Size:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=3)
+        # Decomposed panels: connection and recording
         try:
-            from protocol import get_chunk_sizes, get_default_chunk_size_key
-            chunk_sizes = get_chunk_sizes(self.config)
-            default_chunk_key = get_default_chunk_size_key(self.config)
-            chunk_values = list(chunk_sizes.keys())
+            from connection_panel import ConnectionPanel
+            from recording_panel import RecordingPanel
         except Exception:
-            default_chunk_key = 'Medium'
-            chunk_values = ['Small', 'Medium', 'Large']
+            # Fallback to inline widgets if decomposition modules are unavailable
+            ConnectionPanel = None
+                from .header_panel import HeaderPanel
 
-        self.chunk_size_var = tk.StringVar(value=default_chunk_key)
-        self.chunk_size_combo = ttk.Combobox(recording_frame, textvariable=self.chunk_size_var,
-                                            values=chunk_values, width=10, state="readonly")
-        self.chunk_size_combo.grid(row=2, column=1, sticky=tk.W, padx=5, pady=3)
-        self.chunk_size_combo.bind("<<ComboboxSelected>>", self.update_chunk_size)
-        add_tooltip(self.chunk_size_combo, "Max network packet payload size")
+        if ConnectionPanel:
+            ConnectionPanel(top_row_frame, self)
+        else:
+            # Fallback: recreate minimal connection widgets
+            settings_frame = ttk.LabelFrame(top_row_frame, text="Connection", padding="10")
+            settings_frame.pack(side=tk.LEFT, padx=(0, 10), fill=tk.Y, anchor='nw')
+
+        if RecordingPanel:
+            RecordingPanel(top_row_frame, self)
+        else:
+                from .connection_panel import ConnectionPanel
+                from .recording_panel import RecordingPanel
 
         # --- Middle Row: Voice Controls ---
-        voice_frame_container = ttk.LabelFrame(main_frame, text="Controls", padding="10")
-        voice_frame_container.pack(fill=tk.X, pady=10)
-        voice_frame = ttk.Frame(voice_frame_container)
-        voice_frame.pack() # Center buttons horizontally
-        self.record_button = ttk.Button(voice_frame, text="🎤 Record", command=self.toggle_recording, width=12)
-        self.record_button.pack(side=tk.LEFT, padx=5, pady=5)
-        add_tooltip(self.record_button, "Start/Stop Recording")
-        self.send_button = ttk.Button(voice_frame, text="✉️ Send", command=self.send_voice_message, width=10)
-        self.send_button.pack(side=tk.LEFT, padx=5, pady=5)
-        add_tooltip(self.send_button, "Send Last Recording")
-        self.play_button = ttk.Button(voice_frame, text="▶ Play", command=self.play_selected_message, width=8)
-        self.play_button.pack(side=tk.LEFT, padx=5, pady=5)
-        add_tooltip(self.play_button, "Play Selected Message")
-        self.stop_button = ttk.Button(voice_frame, text="⏹ Stop", command=self.stop_playback, width=8)
-        self.stop_button.pack(side=tk.LEFT, padx=5, pady=5)
-        add_tooltip(self.stop_button, "Stop Playback")
-        self.test_button = ttk.Button(voice_frame, text="🧪 Test Send", command=self.send_test_message, width=12)
-        self.test_button.pack(side=tk.LEFT, padx=(20, 5), pady=5)
-        add_tooltip(self.test_button, "Send Test Message")
+        try:
+            from controls_panel import ControlsPanel
+        except Exception:
+            ControlsPanel = None
+
+        if ControlsPanel:
+            ControlsPanel(main_frame, self)
+        else:
+            # Fallback to inline controls if component missing
+            voice_frame_container = ttk.LabelFrame(main_frame, text="Controls", padding="10")
+            voice_frame_container.pack(fill=tk.X, pady=10)
+            voice_frame = ttk.Frame(voice_frame_container)
+            voice_frame.pack()
+            self.record_button = ttk.Button(voice_frame, text="🎤 Record", command=self.toggle_recording, width=12)
+            self.record_button.pack(side=tk.LEFT, padx=5, pady=5)
+            self.send_button = ttk.Button(voice_frame, text="✉️ Send", command=self.send_voice_message, width=10)
+            self.send_button.pack(side=tk.LEFT, padx=5, pady=5)
+            self.play_button = ttk.Button(voice_frame, text="▶ Play", command=self.play_selected_message, width=8)
+                from .controls_panel import ControlsPanel
+            self.stop_button = ttk.Button(voice_frame, text="⏹ Stop", command=self.stop_playback, width=8)
+            self.stop_button.pack(side=tk.LEFT, padx=5, pady=5)
+            self.test_button = ttk.Button(voice_frame, text="🧪 Test Send", command=self.send_test_message, width=12)
+            self.test_button.pack(side=tk.LEFT, padx=(20, 5), pady=5)
 
         # --- Messages List ---
         messages_frame = ttk.LabelFrame(main_frame, text="Messages", padding="10")
@@ -286,10 +833,18 @@ class AkitaVmailApp:
         self.log_display = scrolledtext.ScrolledText(log_frame, height=8, wrap=tk.WORD)
         self.log_display.pack(fill=tk.BOTH, expand=True)
 
-        # --- Status Bar ---
-        self.status_var = tk.StringVar(value="Status: Disconnected")
-        status_bar = ttk.Label(self.master, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W, style="Status.TLabel")
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        # --- Status Bar (component) ---
+        try:
+            from status_panel import StatusPanel
+        except Exception:
+            StatusPanel = None
+
+        if StatusPanel:
+            StatusPanel(self.master, self)
+        else:
+            self.status_var = tk.StringVar(value="Status: Disconnected")
+            status_bar = ttk.Label(self.master, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W, style="Status.TLabel")
+            status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
 
     def update_status(self, message: str):
@@ -297,7 +852,7 @@ class AkitaVmailApp:
         if self.master and self.master.winfo_exists():
             try: self.status_var.set(f"Status: {message}")
             except tk.TclError: pass # Ignore if window closing
-
+                from .status_panel import StatusPanel
     def update_ui_state(self):
         """Update button states based on connection, recording, playback, and sending status."""
         if not self.master or not self.master.winfo_exists() or not hasattr(self, 'connect_button'):
@@ -366,15 +921,21 @@ class AkitaVmailApp:
     def update_chunk_size(self, event=None):
         """Update the max_chunk_size based on the dropdown selection."""
         selected_key = self.chunk_size_var.get()
-        if selected_key in CHUNK_SIZES:
-            new_size = CHUNK_SIZES[selected_key]
-            if new_size != self.max_chunk_size:
-                self.max_chunk_size = new_size
-                self.log(f"Max network payload size set to {selected_key} ({self.max_chunk_size} bytes)")
-        else:
+        try:
+            from protocol import get_chunk_sizes, get_default_chunk_size_key
+            sizes = get_chunk_sizes(self.config)
+            if selected_key in sizes:
+                new_size = sizes[selected_key]
+                if new_size != self.max_chunk_size:
+                    self.max_chunk_size = new_size
+                    self.log(f"Max network payload size set to {selected_key} ({self.max_chunk_size} bytes)")
+                return
+            # fallback to default
+            default_key = get_default_chunk_size_key(self.config)
+            self.chunk_size_var.set(default_key)
+            self.max_chunk_size = sizes.get(default_key, self.max_chunk_size)
+        except Exception:
             self.log(f"Invalid chunk size key: {selected_key}. Using default.", logging.WARNING)
-            self.chunk_size_var.set(DEFAULT_CHUNK_SIZE_KEY)
-            self.max_chunk_size = DEFAULT_CHUNK_SIZE
 
 
     def toggle_connection(self):

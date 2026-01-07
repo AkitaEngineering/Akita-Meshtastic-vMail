@@ -24,13 +24,7 @@ DEFAULT_AUDIO_CONFIG = {
     "quality_rates_hz": {"Ultra Low": 4000, "Very Low": 8000, "Low": 11025}
 }
 
-# Import config loading utility (use lazy/cached get_config when available)
-try:
-    from utils import get_config, load_config
-except ImportError:
-    logging.critical("FATAL: Cannot import config helpers from utils. Ensure utils.py is present.")
-    get_config = None
-    load_config = None
+# AudioHandler now expects an injected `config` dict; do not load config at import time.
 
 
 class AudioHandler:
@@ -47,20 +41,9 @@ class AudioHandler:
         self.chunk = 1024       # Size of audio chunks read/written at a time
         self.format = pyaudio.paInt16 # Audio format (16-bit integers)
         self.channels = 1       # Mono audio
-        # Determine config-driven values: prefer passed-in config, then cached loader
-        cfg = config
-        if cfg is None:
-            try:
-                cfg = get_config() if get_config else None
-            except Exception:
-                cfg = None
-        if cfg is None and load_config:
-            try:
-                cfg = load_config()
-            except Exception:
-                cfg = None
-
-        audio_section = (cfg or {}).get('audio', {}) if isinstance(cfg, dict) else {}
+        # Use only the injected config (or empty dict) to avoid module-level state.
+        self.config = config or {}
+        audio_section = self.config.get('audio', {}) if isinstance(self.config, dict) else {}
         self.audio_section = audio_section
         self.voice_message_dir = audio_section.get('voice_message_dir', "voice_messages")
 
@@ -68,13 +51,13 @@ class AudioHandler:
         self.quality_rates = audio_section.get("quality_rates_hz", DEFAULT_AUDIO_CONFIG["quality_rates_hz"]) 
         self.default_quality = audio_section.get("default_quality", DEFAULT_AUDIO_CONFIG["default_quality"]) 
         # Ensure default quality exists in rates, else pick first available
-           if self.default_quality not in self.quality_rates and self.quality_rates:
-               self.default_quality = list(self.quality_rates.keys())[0]
-               self.log(f"Configured default quality '{audio_section.get('default_quality')}' not found in rates. Using '{self.default_quality}'.", logging.WARNING)
+        if self.default_quality not in self.quality_rates and self.quality_rates:
+            self.default_quality = list(self.quality_rates.keys())[0]
+            self.log(f"Configured default quality '{audio_section.get('default_quality')}' not found in rates. Using '{self.default_quality}'.", logging.WARNING)
         elif not self.quality_rates: # Handle empty rates config
-             self.quality_rates = DEFAULT_AUDIO_CONFIG["quality_rates_hz"]
-             self.default_quality = DEFAULT_AUDIO_CONFIG["default_quality"]
-             self.log("Audio quality rates missing in config. Using defaults.", logging.WARNING)
+            self.quality_rates = DEFAULT_AUDIO_CONFIG["quality_rates_hz"]
+            self.default_quality = DEFAULT_AUDIO_CONFIG["default_quality"]
+            self.log("Audio quality rates missing in config. Using defaults.", logging.WARNING)
 
         self.rate = self.quality_rates.get(self.default_quality, 11025) # Current sample rate, fallback
 
@@ -99,7 +82,7 @@ class AudioHandler:
         try:
             os.makedirs(self.voice_message_dir, exist_ok=True)
         except OSError as e:
-             self.log(f"Error creating directory {self.voice_message_dir}: {e}", logging.ERROR)
+            self.log(f"Error creating directory {self.voice_message_dir}: {e}", logging.ERROR)
 
         self.log(f"AudioHandler initialized. Default Quality: {self.default_quality} ({self.rate}Hz), Default Length: {self.record_seconds}s")
 
