@@ -27,9 +27,20 @@ DEFAULT_CONFIG = {
         "default_key": "Medium",
         "retry_count": 2,
         "retry_delay_sec": 1.0,
+        "ack_timeout_sec": 2.0,
         "receive_timeout_sec": 60
     }
 }
+
+# Fallback constants (used when callers do not pass a config dict)
+PRIVATE_APP_PORT = DEFAULT_CONFIG['meshtastic_port_num']
+CHUNK_SIZES = DEFAULT_CONFIG['chunking']['sizes']
+DEFAULT_CHUNK_SIZE_KEY = DEFAULT_CONFIG['chunking']['default_key']
+DEFAULT_CHUNK_SIZE = CHUNK_SIZES.get(DEFAULT_CHUNK_SIZE_KEY, 180)
+CHUNK_RETRY_COUNT = DEFAULT_CONFIG['chunking']['retry_count']
+CHUNK_RETRY_DELAY = DEFAULT_CONFIG['chunking']['retry_delay_sec']
+ACK_TIMEOUT = DEFAULT_CONFIG['chunking']['ack_timeout_sec']
+CHUNK_TIMEOUT = DEFAULT_CONFIG['chunking']['receive_timeout_sec']
 
 # The protocol module no longer stores config-bound module-level constants.
 # Callers should pass an explicit `config` dict into the getters below.
@@ -75,6 +86,11 @@ def get_chunk_retry_delay(config: dict | None = None) -> float:
     if isinstance(config, dict):
         return config.get("chunking", DEFAULT_CONFIG["chunking"]).get("retry_delay_sec", DEFAULT_CONFIG["chunking"]["retry_delay_sec"])
     return CHUNK_RETRY_DELAY
+
+def get_ack_timeout(config: dict | None = None) -> float:
+    if isinstance(config, dict):
+        return config.get("chunking", DEFAULT_CONFIG["chunking"]).get("ack_timeout_sec", DEFAULT_CONFIG["chunking"]["ack_timeout_sec"])
+    return ACK_TIMEOUT
 
 def get_chunk_timeout(config: dict | None = None) -> int:
     if isinstance(config, dict):

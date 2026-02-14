@@ -9,6 +9,7 @@ import pyaudio      # For audio I/O
 import wave         # For reading/writing WAV files
 import os           # For path manipulation, directory creation
 import time         # For sleep
+import threading   # For timers used to auto-stop recordings
 import zlib         # For data compression/decompression
 import audioop      # For audio operations like rate conversion, bit depth change
 import struct       # For packing/unpacking header data
@@ -73,7 +74,7 @@ class AudioHandler:
         # --- PyAudio Instance and Stream ---
         try:
             self.p = pyaudio.PyAudio() # Initialize PyAudio
-            self.stream = None         # Placeholder for the PyAudio stream object
+            self.stream = None         # PyAudio stream object, managed in start/stop methods
         except Exception as e:
             self.log(f"FATAL: Failed to initialize PyAudio: {e}", logging.CRITICAL)
             self.p = None # Indicate PyAudio failed
@@ -155,6 +156,8 @@ class AudioHandler:
                                       stream_callback=self._recording_callback)
             self.log(f"Recording for {self.record_seconds} seconds at {self.rate}Hz...")
             self.stream.start_stream()
+            # Ensure stream is closed after recording and file is written
+            threading.Timer(self.record_seconds, self.stop_recording, args=(filepath,)).start()
             return True, filepath
         except OSError as e:
              self.log(f"OS Error starting recording stream (device issue?): {e}", logging.ERROR)

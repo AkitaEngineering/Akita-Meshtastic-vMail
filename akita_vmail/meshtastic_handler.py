@@ -21,13 +21,13 @@ import queue
 
 # Import protocol helpers (use runtime getters to avoid module-level constant binding)
 try:
-    from protocol import (
+    from .protocol import (
         BROADCAST_ADDR, create_chunk_payload, create_ack_payload,
         create_test_payload, create_complete_voice_payload,
         parse_payload, verify_chunk_crc, verify_complete_voice_crc,
         split_data_into_chunks, generate_unique_id,
         MSG_TYPE_VOICE_CHUNK, MSG_TYPE_ACK, MSG_TYPE_TEST,
-        MSG_TYPE_COMPLETE_VOICE, get_private_app_port, get_chunk_retry_count, get_chunk_retry_delay
+            MSG_TYPE_COMPLETE_VOICE, get_private_app_port, get_chunk_retry_count, get_chunk_retry_delay, get_ack_timeout
     )
 except ImportError as e:
      logging.critical(f"FATAL: Cannot import from protocol module: {e}. Ensure protocol.py is present.")
@@ -59,6 +59,13 @@ class MeshtasticHandler:
         self.send_lock = threading.Lock()
         self._connection_thread = None
         self.node_list = {} # Store node info {nodeId: nodeInfoDict}
+        # Pending ACKs storage: {(chunk_id, chunk_num): threading.Event}
+        self._pending_acks: dict = {}
+        self._pending_acks_lock = threading.Lock()
+        # Received ACKs history (for debugging/metrics): {(chunk_id, chunk_num): [from_ids]}
+        self._received_acks: dict = {}
+        # Retransmit counters: {(chunk_id, chunk_num): int}
+        self._retransmit_counts: dict = {}
 
     def log(self, message: str, level=logging.INFO):
         """Log messages via the root logger (which uses the queue)."""
@@ -278,6 +285,15 @@ class MeshtasticHandler:
             if target_port is not None and str(portnum) == str(target_port) and payload:
                 self.log(f"Received App Data (Port {portnum}) from {from_id_hex} [RSSI:{rssi} SNR:{snr} ID:{packet_id}] ({len(payload)} bytes)", logging.INFO)
                 parsed_data = parse_payload(payload)
+                # If this is an ACK, process it internally for send-side retransmit logic
+                try:
+                    if parsed_data and isinstance(parsed_data, dict) and parsed_data.get('type') == MSG_TYPE_ACK:
+                        ack_id = parsed_data.get('ack_id') or parsed_data.get('ackId') or parsed_data.get('chunk_id')
+                        ack_num = parsed_data.get('chunk_num')
+                        if ack_id and isinstance(ack_num, int):
+                            self._set_ack_received(ack_id, ack_num, from_id_hex)
+                except Exception:
+                    pass
                 if parsed_data:
                     self.receive_callback('data', parsed_data, from_id_hex, packet_id)
                 else:
@@ -295,6 +311,54 @@ class MeshtasticHandler:
             self.log(f"Error processing received packet in _on_receive_raw: {e}", logging.ERROR)
             import traceback
             self.log(traceback.format_exc(), logging.ERROR)
+
+    # --- ACK handling helpers ---
+    def _register_pending_ack(self, chunk_id: str, chunk_num: int):
+        """Register a pending ACK and return the Event to wait on."""
+        key = (chunk_id, chunk_num)
+        ev = threading.Event()
+        with self._pending_acks_lock:
+            self._pending_acks[key] = ev
+        return ev
+
+    def _unregister_pending_ack(self, chunk_id: str, chunk_num: int):
+        key = (chunk_id, chunk_num)
+        with self._pending_acks_lock:
+            if key in self._pending_acks:
+                try:
+                    del self._pending_acks[key]
+                except KeyError:
+                    pass
+
+    def _set_ack_received(self, chunk_id: str, chunk_num: int, from_id: str):
+        key = (chunk_id, chunk_num)
+        with self._pending_acks_lock:
+            ev = self._pending_acks.get(key)
+        if ev:
+            try:
+                # record received ack
+                with self._pending_acks_lock:
+                    self._received_acks.setdefault(key, []).append(from_id)
+                ev.set()
+            except Exception:
+                pass
+        else:
+            # Not currently waiting for this ACK; still record it for metrics
+            with self._pending_acks_lock:
+                self._received_acks.setdefault(key, []).append(from_id)
+
+    def _increment_retransmit_count(self, chunk_id: str, chunk_num: int):
+        key = (chunk_id, chunk_num)
+        with self._pending_acks_lock:
+            self._retransmit_counts[key] = self._retransmit_counts.get(key, 0) + 1
+
+    def get_pending_ack_count(self) -> int:
+        with self._pending_acks_lock:
+            return len(self._pending_acks)
+
+    def get_total_retransmits(self) -> int:
+        with self._pending_acks_lock:
+            return sum(self._retransmit_counts.values())
 
 
     def send_data(self, payload_bytes: bytes, description: str = "data") -> bool:
@@ -373,6 +437,7 @@ class MeshtasticHandler:
                     retry_count = 2
                     retry_delay = 1.0
 
+                # For each attempt: send and wait for ACK. If ACK not received within wait_time, retry.
                 for attempt in range(retry_count + 1):
                     self.log(f"Sending chunk {chunk_num}/{total_chunks} (ID:{chunk_id}, Attempt {attempt+1})...")
                     try:
@@ -382,20 +447,49 @@ class MeshtasticHandler:
                             portNum=portnum, wantAck=True
                         )
                         self.log(f"Chunk {chunk_num} send command issued.")
-                        send_success_this_chunk = True
-                        break # Exit retry loop
                     except meshtastic.MeshtasticError as e:
                         self.log(f"Meshtastic error sending chunk {chunk_num} (Attempt {attempt+1}): {e}", logging.WARNING)
+                        if attempt < retry_count:
+                            self.log(f"Waiting {retry_delay}s before retrying chunk {chunk_num} (send error)...")
+                            time.sleep(retry_delay)
+                        continue
                     except Exception as e:
                         self.log(f"Unexpected error sending chunk {chunk_num} (Attempt {attempt+1}): {e}", logging.WARNING)
+                        if attempt < retry_count:
+                            self.log(f"Waiting {retry_delay}s before retrying chunk {chunk_num} (send exception)...")
+                            time.sleep(retry_delay)
+                        continue
 
-                    if attempt < retry_count:
-                        self.log(f"Waiting {retry_delay}s before retrying chunk {chunk_num}...")
-                        time.sleep(retry_delay)
+                    # After send issued, wait for ACK
+                    ack_event = self._register_pending_ack(chunk_id, chunk_num)
+                    try:
+                        # Wait time for ACK: use retry_delay * 2 as heuristic
+                        wait_time = max(1.0, retry_delay * 2)
+                        self.log(f"Waiting up to {wait_time}s for ACK of chunk {chunk_num} (ID:{chunk_id})...")
+                        got = ack_event.wait(wait_time)
+                        if got:
+                            self.log(f"Received ACK for chunk {chunk_num} (ID:{chunk_id}).")
+                            send_success_this_chunk = True
+                            break
+                        else:
+                            self.log(f"No ACK received for chunk {chunk_num} (ID:{chunk_id}) on attempt {attempt+1}.", logging.WARNING)
+                            # Continue to next attempt which will resend
+                            if attempt < retry_count:
+                                        # record retransmit and wait before retrying
+                                        try:
+                                            self._increment_retransmit_count(chunk_id, chunk_num)
+                                        except Exception:
+                                            pass
+                                        self.log(f"Retrying chunk {chunk_num} after {retry_delay}s...")
+                                        time.sleep(retry_delay)
+                            continue
+                    finally:
+                        # Cleanup pending ack entry if still present
+                        self._unregister_pending_ack(chunk_id, chunk_num)
 
                 if not send_success_this_chunk:
-                    self.log(f"Failed to send chunk {chunk_num} (ID:{chunk_id}) after {retry_count + 1} attempts. Aborting message.", logging.ERROR)
-                    return False # Abort sending
+                    self.log(f"Failed to get ACK for chunk {chunk_num} (ID:{chunk_id}) after {retry_count + 1} attempts. Aborting message.", logging.ERROR)
+                    return False
 
                 # Wait between chunks
                 inter_chunk_delay = 1.0 + (len(payload_bytes) / 200.0) # Example dynamic delay
